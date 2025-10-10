@@ -195,6 +195,6 @@ python3 tests/test_functionality.py
 
 **⭐ 如果这个项目对你有帮助，请给它一个星！** 
 
-Made with ❤️ by [Your Name](https://github.com/jianjianDong)
+Made with ❤️ by [BPP](https://github.com/jianjianDong)
 
 </div>
