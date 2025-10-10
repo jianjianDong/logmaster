@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+LogMaster Pro - Android日志大师
+一个专业级的Android日志分析工具
+"""
+
+import sys
+import os
+import re
+import subprocess
+import threading
+import time
+from datetime import datetime
+from typing import Optional, Callable, List
+from dataclasses import dataclass
+from enum import Enum
+
+
+class LogLevel(Enum):
+    """日志级别"""
+    VERBOSE = "V"
+    DEBUG = "D"
+    INFO = "I"
+    WARNING = "W"
+    ERROR = "E"
+    FATAL = "F"
+
+
+@dataclass
+class LogEntry:
+    """日志条目"""
+    timestamp: str
+    pid: str
+    tid: str
+    level: LogLevel
+    tag: str
+    message: str
+    raw_line: str
+    device_serial: str = ""
+
+
+class Device:
+    """设备信息"""
+    def __init__(self, serial: str, status: str, product: str = "", model: str = "", device: str = "", transport_id: str = ""):
+        self.serial = serial
+        self.status = status
+        self.product = product
+        self.model = model
+        self.device = device
+        self.transport_id = transport_id
+
+
+class DeviceManager:
+    """设备管理器"""
+    def __init__(self):
+        self.devices: List[Device] = []
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._callbacks: List[Callable] = []
+        
+    def add_device_callback(self, callback: Callable):
+        """添加设备变化回调函数"""
+        self._callbacks.append(callback)
+        
+    def _notify_callbacks(self):
+        """通知所有回调函数设备列表已更新"""
+        for callback in self._callbacks:
+            try:
+                callback(self.devices)
+            except Exception as e:
+                print(f"回调函数执行错误: {e}")
+    
+    def get_devices(self) -> List[Device]:
+        """获取当前连接的设备列表"""
+        try:
+            result = subprocess.run(['adb', 'devices', '-l'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                self._parse_devices_output(result.stdout)
+            else:
+                print(f"ADB命令执行失败: {result.stderr}")
+                self.devices = []
+        except subprocess.TimeoutExpired:
+            print("ADB命令超时")
+            self.devices = []
+        except FileNotFoundError:
+            print("未找到ADB命令，请确保Android SDK已安装并配置环境变量")
+            self.devices = []
+        except Exception as e:
+            print(f"获取设备列表时出错: {e}")
+            self.devices = []
+            
+        self._notify_callbacks()
+        return self.devices
+    
+    def _parse_devices_output(self, output: str):
+        """解析adb devices -l的输出"""
+        devices = []
+        lines = output.strip().split('\n')
+        
+        for line in lines[1:]:  # 跳过第一行的"List of devices attached"
+            if not line.strip():
+                continue
+                
+            parts = line.split()
+            if len(parts) >= 2:
+                serial = parts[0]
+                status = parts[1]
+                
+                device = Device(serial=serial, status=status)
+                
+                # 解析额外的设备信息
+                for part in parts[2:]:
+                    if ':' in part:
+                        key, value = part.split(':', 1)
+                        if key == 'product':
+                            device.product = value
+                        elif key == 'model':
+                            device.model = value
+                        elif key == 'device':
+                            device.device = value
+                        elif key == 'transport_id':
+                            device.transport_id = value
+                
+                devices.append(device)
+        
+        self.devices = devices
+    
+    def start_monitoring(self, interval: float = 1.0):
+        """开始监控设备连接状态"""
+        if self._running:
+            return
+            
+        self._running = True
+        self._monitor_thread = threading.Thread(target=self._monitor_devices, 
+                                            args=(interval,), daemon=True)
+        self._monitor_thread.start()
+    
+    def stop_monitoring(self):
+        """停止监控设备连接状态"""
+        self._running = False
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=2)
+    
+    def _monitor_devices(self, interval: float):
+        """监控设备连接状态的线程函数"""
+        previous_devices = self.get_devices().copy()
+        
+        while self._running:
+            time.sleep(interval)
+            current_devices = self.get_devices()
+            
+            # 检查设备变化
+            if self._devices_changed(previous_devices, current_devices):
+                self._handle_device_change(previous_devices, current_devices)
+                previous_devices = current_devices.copy()
+    
+    def _devices_changed(self, old_devices: List[Device], 
+                        new_devices: List[Device]) -> bool:
+        """检查设备列表是否发生变化"""
+        if len(old_devices) != len(new_devices):
+            return True
+            
+        old_serials = {d.serial for d in old_devices}
+        new_serials = {d.serial for d in new_devices}
+        
+        return old_serials != new_serials
+    
+    def _handle_device_change(self, old_devices: List[Device], 
+                             new_devices: List[Device]):
+        """处理设备变化事件"""
+        old_serials = {d.serial for d in old_devices}
+        new_serials = {d.serial for d in new_devices}
+        
+        connected = new_serials - old_serials
+        disconnected = old_serials - new_serials
+        
+        if connected:
+            print(f"设备连接: {connected}")
+        if disconnected:
+            print(f"设备断开: {disconnected}")
+    
+    def is_adb_available(self) -> bool:
+        """检查ADB是否可用"""
+        try:
+            result = subprocess.run(['adb', 'version'], 
+                                  capture_output=True, text=True, timeout=3)
+            return result.returncode == 0
+        except:
+            return False
+    
+    def get_adb_version(self) -> Optional[str]:
+        """获取ADB版本"""
+        try:
+            result = subprocess.run(['adb', 'version'], 
+                                  capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                # 解析版本信息
+                match = re.search(r'Android Debug Bridge version (\d+\.\d+\.\d+)', 
+                                result.stdout)
+                if match:
+                    return match.group(1)
+            return None
+        except:
+            return None
+
+
+class LogcatReader:
+    """日志读取器"""
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self._read_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._callbacks: List[Callable] = []
+        self._filters = {
+            'level': None,
+            'tag': None,
+            'tag_regex': False,
+            'keyword': None,
+            'pid': None
+        }
+        self._buffer_size = 10000  # 缓冲区大小
+        self._log_buffer: List[LogEntry] = []
+        self._buffer_lock = threading.Lock()
+        self._last_log_time = time.time()
+        self._log_count = 0
+        
+    def add_log_callback(self, callback: Callable):
+        """添加日志回调函数"""
+        self._callbacks.append(callback)
+        
+    def remove_log_callback(self, callback: Callable):
+        """移除日志回调函数"""
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+        
+    def _notify_callbacks(self, log_entry: LogEntry):
+        """通知所有回调函数有新的日志条目"""
+        for callback in self._callbacks:
+            try:
+                callback(log_entry)
+            except Exception as e:
+                print(f"日志回调函数执行错误: {e}")
+    
+    def start_logcat(self, device_serial: str, clear_buffer: bool = True,
+                    filters: Optional[dict] = None):
+        """开始读取logcat"""
+        if self._running:
+            self.stop_logcat()
+        
+        if clear_buffer:
+            self._clear_logcat_buffer(device_serial)
+        
+        # 应用过滤器
+        if filters:
+            self._filters.update(filters)
+        
+        # 构建adb logcat命令 - 简化命令，避免复杂参数
+        cmd = ['adb', '-s', device_serial, 'logcat', '-v', 'threadtime']
+        
+        # 应用级别过滤器
+        if self._filters['level']:
+            cmd.extend(['*:' + self._filters['level']])
+        
+        print(f"启动logcat命令: {' '.join(cmd)}")
+        print(f"过滤器设置: {self._filters}")
+        
+        try:
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                          stderr=subprocess.PIPE, 
+                                          universal_newlines=True,
+                                          bufsize=1)
+            
+            self._running = True
+            self._log_count = 0
+            self._last_log_time = time.time()
+            
+            self._read_thread = threading.Thread(target=self._read_logcat_output,
+                                               args=(device_serial,), 
+                                               daemon=True)
+            self._read_thread.start()
+            
+            print("Logcat读取线程已启动")
+            
+        except Exception as e:
+            print(f"启动logcat失败: {e}")
+            self._running = False
+            
+    def stop_logcat(self):
+        """停止读取logcat"""
+        print("正在停止logcat...")
+        self._running = False
+        
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            except:
+                pass
+            finally:
+                self.process = None
+        
+        if self._read_thread and self._read_thread.is_alive():
+            self._read_thread.join(timeout=2)
+            
+        print("Logcat已停止")
+    
+    def _clear_logcat_buffer(self, device_serial: str):
+        """清除logcat缓冲区"""
+        try:
+            result = subprocess.run(['adb', '-s', device_serial, 'logcat', '-c'], 
+                                   capture_output=True, timeout=5)
+            print(f"清除缓冲区结果: {result.returncode}")
+        except Exception as e:
+            print(f"清除缓冲区失败: {e}")
+    
+    def _read_logcat_output(self, device_serial: str):
+        """读取logcat输出的线程函数"""
+        print("开始读取logcat输出...")
+        if not self.process:
+            print("进程不存在")
+            return
+            
+        try:
+            while self._running and self.process.poll() is None:
+                line = self.process.stdout.readline()
+                if not line:
+                    time.sleep(0.01)  # 短暂等待，避免CPU占用过高
+                    continue
+                
+                # 调试输出
+                if self._log_count < 5:  # 只显示前5行的调试信息
+                    print(f"原始日志行: {line.strip()}")
+                
+                log_entry = self._parse_log_line(line.strip(), device_serial)
+                if log_entry:
+                    self._log_count += 1
+                    
+                    # 应用过滤器
+                    if self._should_include_log(log_entry):
+                        # 添加到缓冲区
+                        with self._buffer_lock:
+                            self._log_buffer.append(log_entry)
+                            if len(self._log_buffer) > self._buffer_size:
+                                self._log_buffer.pop(0)
+                        
+                        # 通知回调
+                        self._notify_callbacks(log_entry)
+                        
+                        # 更新最后日志时间
+                        self._last_log_time = time.time()
+                        
+                        if self._log_count <= 5:
+                            print(f"处理日志: {log_entry.tag} - {log_entry.message[:50]}")
+                    else:
+                        if self._log_count <= 5:
+                            print(f"日志被过滤: {log_entry.tag} - {log_entry.message[:50]}")
+                        
+        except Exception as e:
+            print(f"读取logcat输出时出错: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._running = False
+            print(f"日志读取线程结束，运行状态: {self._running}, 进程状态: {self.process.poll() if self.process else 'None'}")
+            print(f"总共处理了 {self._log_count} 条日志")
+    
+    def _parse_log_line(self, line: str, device_serial: str) -> Optional[LogEntry]:
+        """解析logcat输出行"""
+        if not line:
+            return None
+            
+        # 解析格式: MM-DD HH:MM:SS.mmm PID TID L TAG: message
+        pattern = r'(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+([^:\s]+):\s+(.*)'
+        
+        match = re.match(pattern, line)
+        if match:
+            timestamp, pid, tid, level, tag, message = match.groups()
+            
+            try:
+                log_level = LogLevel(level)
+            except ValueError:
+                log_level = LogLevel.VERBOSE
+            
+            return LogEntry(
+                timestamp=timestamp,
+                pid=pid,
+                tid=tid,
+                level=log_level,
+                tag=tag,
+                message=message,
+                raw_line=line,
+                device_serial=device_serial
+            )
+        
+        # 如果正则表达式匹配失败，尝试更宽松的匹配
+        loose_pattern = r'(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+(.*)'
+        loose_match = re.match(loose_pattern, line)
+        if loose_match:
+            timestamp, pid, tid, level, rest = loose_match.groups()
+            
+            # 尝试从剩余部分提取标签和消息
+            if ':' in rest:
+                tag, message = rest.split(':', 1)
+                tag = tag.strip()
+                message = message.strip()
+            else:
+                tag = "Unknown"
+                message = rest
+            
+            try:
+                log_level = LogLevel(level)
+            except ValueError:
+                log_level = LogLevel.VERBOSE
+            
+            return LogEntry(
+                timestamp=timestamp,
+                pid=pid,
+                tid=tid,
+                level=log_level,
+                tag=tag,
+                message=message,
+                raw_line=line,
+                device_serial=device_serial
+            )
+        
+        return None
+    
+    def _should_include_log(self, log_entry: LogEntry) -> bool:
+        """检查日志条目是否应该被包含（应用过滤器）"""
+        # 级别过滤
+        if self._filters['level']:
+            level_priority = {
+                'V': 0, 'D': 1, 'I': 2, 'W': 3, 'E': 4, 'F': 5
+            }
+            entry_priority = level_priority.get(log_entry.level.value, 0)
+            filter_priority = level_priority.get(self._filters['level'], 0)
+            if entry_priority < filter_priority:
+                return False
+        
+        # 标签过滤 - 支持正则表达式和多标签匹配
+        if self._filters['tag']:
+            filter_tag = self._filters['tag'].strip()
+            entry_tag = log_entry.tag.strip()
+            
+            # 检查是否启用正则表达式模式
+            if self._filters.get('tag_regex', False):
+                try:
+                    # 使用正则表达式匹配
+                    if not re.search(filter_tag, entry_tag, re.IGNORECASE):
+                        return False
+                except re.error:
+                    # 如果正则表达式无效，降级为普通匹配
+                    if filter_tag.lower() not in entry_tag.lower():
+                        return False
+            else:
+                # 检查是否包含逗号分隔的多个标签
+                if ',' in filter_tag:
+                    # 多个标签，使用OR逻辑
+                    tags = [tag.strip().lower() for tag in filter_tag.split(',')]
+                    if not any(tag in entry_tag.lower() for tag in tags):
+                        return False
+                else:
+                    # 单个标签，使用包含匹配
+                    if filter_tag.lower() not in entry_tag.lower():
+                        return False
+        
+        # 关键字过滤 - 在标签和消息中搜索，不区分大小写
+        if self._filters['keyword']:
+            keyword = self._filters['keyword'].lower().strip()
+            entry_tag = log_entry.tag.lower().strip()
+            entry_message = log_entry.message.lower().strip()
+            
+            # 关键字必须在标签或消息中找到
+            if keyword not in entry_tag and keyword not in entry_message:
+                return False
+        
+        # PID过滤
+        if self._filters['pid']:
+            if log_entry.pid != self._filters['pid']:
+                return False
+        
+        return True
+    
+    def set_filter(self, filter_type: str, value: Optional[str]):
+        """设置过滤器"""
+        if filter_type in self._filters:
+            old_value = self._filters[filter_type]
+            self._filters[filter_type] = value
+            
+            if old_value != value:
+                print(f"过滤器 {filter_type} 更新: {old_value} -> {value}")
+    
+    def get_buffered_logs(self) -> List[LogEntry]:
+        """获取缓冲区中的日志"""
+        with self._buffer_lock:
+            return self._log_buffer.copy()
+    
+    def clear_buffer(self):
+        """清空日志缓冲区"""
+        with self._buffer_lock:
+            self._log_buffer.clear()
+            self._log_count = 0
+    
+    def save_logs_to_file(self, filename: str, logs: Optional[List[LogEntry]] = None):
+        """保存日志到文件"""
+        if logs is None:
+            logs = self.get_buffered_logs()
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"LogMaster Pro - Android日志\n")
+                f.write(f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"设备: {logs[0].device_serial if logs else 'Unknown'}\n")
+                f.write(f"日志数量: {len(logs)}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for log_entry in logs:
+                    f.write(f"{log_entry.raw_line}\n")
+                    
+            print(f"日志保存成功: {filename} ({len(logs)} 条)")
+            return True
+        except Exception as e:
+            print(f"保存日志文件失败: {e}")
+            return False
+    
+    def get_stats(self):
+        """获取统计信息"""
+        with self._buffer_lock:
+            return {
+                'total_logs': len(self._log_buffer),
+                'processed_logs': self._log_count,
+                'last_log_time': self._last_log_time,
+                'is_running': self._running
+            }
