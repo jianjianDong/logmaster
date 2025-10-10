@@ -42,6 +42,8 @@ class LogUpdateThread(QThread):
     def stop(self):
         """停止线程"""
         self.running = False
+        # 等待一小段时间让线程自然结束
+        self.msleep(50)
 
 
 class LogTextEdit(QPlainTextEdit):
@@ -64,6 +66,10 @@ class LogTextEdit(QPlainTextEdit):
         self.setup_colors()
         self.max_lines = 100000  # 限制最大行数
         self.auto_scroll_checkbox = None  # 自动滚动复选框引用，稍后设置
+        self._scroll_timer = QTimer()  # 添加滚动定时器
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._perform_delayed_scroll)
+        self._pending_scroll = False  # 标记是否有待执行的滚动
         
     def setup_colors(self):
         """设置日志级别颜色"""
@@ -110,45 +116,26 @@ class LogTextEdit(QPlainTextEdit):
         cursor.movePosition(QTextCursor.End)
         cursor.insertText(log_line + "\n", format)
         
-        # 只有在以下情况才自动滚动：
-        # 1. 自动滚动复选框被选中
-        # 2. 用户没有在选中文本
-        # 3. 当前焦点不在输入框中
-        current_cursor = self.textCursor()
-        is_input_focused = isinstance(focus_widget, (QLineEdit, QComboBox, QCheckBox))
-        
-        # 检查自动滚动复选框状态
-        auto_scroll_enabled = True
-        if self.auto_scroll_checkbox:
-            auto_scroll_enabled = self.auto_scroll_checkbox.isChecked()
-        
-        # 修复自动滚动逻辑：只有在用户没有主动滚动到非底部位置时才自动滚动
-        should_auto_scroll = (auto_scroll_enabled and 
-                            not current_cursor.hasSelection() and 
-                            not is_input_focused)
-        
-        if should_auto_scroll:
-            # 检查当前滚动位置是否接近底部（在100行内）
-            try:
-                scrollbar = self.verticalScrollBar()
-                if scrollbar:
-                    current_value = scrollbar.value()
-                    max_value = scrollbar.maximum()
-                    # 如果当前滚动位置在底部附近（100行内），则自动滚动
-                    # 使用像素计算而不是行数，更精确
-                    page_step = scrollbar.pageStep()
-                    if max_value - current_value <= page_step:
-                        # 使用新的光标位置
-                        new_cursor = QTextCursor(self.document())
-                        new_cursor.movePosition(QTextCursor.End)
-                        self.setTextCursor(new_cursor)
-                        self.ensureCursorVisible()
-            except Exception as e:
-                # 如果滚动条计算失败，仍然执行基本的自动滚动
-                new_cursor = QTextCursor(self.document())
-                new_cursor.movePosition(QTextCursor.End)
-                self.setTextCursor(new_cursor)
-                self.ensureCursorVisible()
+        # 简化的自动滚动逻辑：只要复选框选中就滚动到底部
+        if self.auto_scroll_checkbox and self.auto_scroll_checkbox.isChecked():
+            # 使用延迟滚动，避免频繁操作影响性能
+            if not self._pending_scroll:
+                self._pending_scroll = True
+                self._scroll_timer.start(10)  # 10ms延迟，确保UI更新完成
+                
+    def _perform_delayed_scroll(self):
+        """执行延迟滚动"""
+        self._pending_scroll = False
+        scrollbar = self.verticalScrollBar()
+        if scrollbar:
+            # 直接设置到最大值，确保看到最新日志
+            scrollbar.setValue(scrollbar.maximum())
+                
+    def scroll_to_bottom(self):
+        """强制滚动到底部 - 用于手动触发"""
+        scrollbar = self.verticalScrollBar()
+        if scrollbar:
+            scrollbar.setValue(scrollbar.maximum())
 
 
 class LogMasterPro(QMainWindow):
@@ -484,6 +471,30 @@ class LogMasterPro(QMainWindow):
         """)
         toolbar.addWidget(self.auto_scroll_checkbox)
         
+        # 添加滚动到底部按钮 - 重新设计，更直观
+        scroll_bottom_btn = QPushButton("🔽 最新日志")
+        scroll_bottom_btn.setToolTip("滚动到最新的日志条目")
+        scroll_bottom_btn.setFixedSize(80, 28)
+        scroll_bottom_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+            }
+            QPushButton:hover {
+                background-color: #229954;
+            }
+            QPushButton:pressed {
+                background-color: #1e8449;
+            }
+        """)
+        scroll_bottom_btn.clicked.connect(lambda: self.log_text.scroll_to_bottom())
+        toolbar.addWidget(scroll_bottom_btn)
+        
     def create_device_control_group(self) -> QGroupBox:
         """创建设备控制组"""
         group = QGroupBox("设备控制")
@@ -722,10 +733,58 @@ class LogMasterPro(QMainWindow):
                         break
                         
     def on_device_changed(self):
-        """设备选择变化处理"""
-        if self.is_logging:
-            self.stop_logging()
-            
+        """设备选择变化处理 - 增强防抖版"""
+        print(f"设备变化事件触发，当前记录状态: {self.is_logging}")
+        
+        # 添加防抖机制，避免频繁重启
+        if hasattr(self, '_device_change_timer'):
+            self._device_change_timer.stop()
+        else:
+            self._device_change_timer = QTimer()
+            self._device_change_timer.setSingleShot(True)
+            self._device_change_timer.timeout.connect(self._handle_device_change_delayed)
+        
+        # 延迟处理设备变化（1500ms防抖，避免过于频繁）
+        self._device_change_timer.start(1500)
+    
+    def _handle_device_change_delayed(self):
+        """延迟处理设备变化 - 同一设备不停止记录"""
+        print("执行延迟设备变化处理")
+        
+        # 获取当前选中的设备
+        current_selected_device = None
+        index = self.device_combo.currentIndex()
+        if index >= 0:
+            current_selected_device = self.device_combo.itemData(index)
+        
+        # 如果正在记录，检查是否是同一个设备
+        if self.is_logging and self.current_device and current_selected_device:
+            # 如果是同一个设备（序列号相同），不停止记录
+            if self.current_device.serial == current_selected_device.serial:
+                print(f"同一设备状态变化，继续记录: {self.current_device.serial}")
+                self._update_device_selection()  # 只更新选择，不停止记录
+                return
+            else:
+                print(f"设备切换: {self.current_device.serial} -> {current_selected_device.serial}")
+                print("设备变化时正在记录，先停止当前记录")
+                self.stop_logging()
+                # 延迟重新启动（3秒后，给设备充分时间稳定）
+                QTimer.singleShot(3000, self._restart_logging_with_new_device)
+        else:
+            self._update_device_selection()
+    
+    def _restart_logging_with_new_device(self):
+        """使用新设备重新启动记录"""
+        print("尝试自动重新启动日志记录")
+        self._update_device_selection()
+        if self.current_device and self.current_device.status == "device":
+            print("条件满足，自动重新启动日志记录")
+            self.start_logging()
+        else:
+            print("条件不满足，不自动重新启动")
+    
+    def _update_device_selection(self):
+        """更新设备选择（不处理记录状态）"""
         index = self.device_combo.currentIndex()
         if index >= 0:
             device = self.device_combo.itemData(index)
@@ -758,9 +817,14 @@ class LogMasterPro(QMainWindow):
             self.start_logging()
             
     def start_logging(self):
-        """开始日志记录"""
+        """开始日志记录 - 增强版"""
         print("开始日志记录函数被调用")
         
+        # 添加状态保护
+        if self.is_logging:
+            print("已经在记录中，跳过启动")
+            return
+            
         if not self.current_device:
             QMessageBox.warning(self, "警告", "请先选择设备")
             return
@@ -768,18 +832,20 @@ class LogMasterPro(QMainWindow):
         if self.current_device.status != "device":
             QMessageBox.warning(self, "警告", "设备未连接或状态异常")
             return
-            
+        
         # 获取过滤器设置
         filters = self.get_filter_settings()
         print(f"过滤器设置: {filters}")
         
-        # 保存当前滚动状态（仅在应用过滤器时不清空显示）
-        preserve_content = self.is_logging  # 如果已经在记录，说明是过滤器变更
-        if preserve_content:
-            current_scroll_value = self.log_text.verticalScrollBar().value()
-            was_at_bottom = current_scroll_value >= self.log_text.verticalScrollBar().maximum() - 100
-        
         try:
+            print(f"启动设备 {self.current_device.serial} 的logcat")
+            
+            # 确保之前的线程已完全停止
+            if self.log_update_thread and self.log_update_thread.isRunning():
+                print("等待之前的日志线程停止...")
+                self.log_update_thread.stop()
+                self.log_update_thread.wait(2000)  # 最多等待2秒
+            
             # 开始logcat
             self.logcat_reader.start_logcat(self.current_device.serial, 
                                            clear_buffer=True, filters=filters)
@@ -790,23 +856,11 @@ class LogMasterPro(QMainWindow):
             self.log_update_thread.start()
             
             self.is_logging = True
-            self.start_stop_action.setText("⏸ 停止")  # 使用更简洁的文字
-            self.start_stop_action.setToolTip("停止当前日志记录")
-            self.statusBar().showMessage("正在记录日志...")
-            # 更新窗口标题显示记录状态
-            if self.current_device:
-                self.setWindowTitle(f'Logmaster - {self.current_device.serial} [正在记录]')
-            else:
-                self.setWindowTitle('Logmaster - Android日志分析工具 [正在记录]')
+            self.update_ui_for_logging_state(True)
             
-            # 只有在首次启动时才清空显示，过滤器变更时保留内容
-            if not preserve_content:
-                self.log_text.clear()
-                self.log_count = 0
-            else:
-                # 恢复滚动位置
-                if not self.auto_scroll_checkbox.isChecked():
-                    QTimer.singleShot(100, lambda: self.log_text.verticalScrollBar().setValue(current_scroll_value))
+            # 清空显示并重置计数
+            self.log_text.clear()
+            self.log_count = 0
             
             self.update_log_stats()
             
@@ -817,22 +871,43 @@ class LogMasterPro(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "错误", f"启动日志记录失败: {e}")
+            self.is_logging = False
         
+    def update_ui_for_logging_state(self, is_logging: bool):
+        """更新UI状态"""
+        if is_logging:
+            self.start_stop_action.setText("⏸ 停止")
+            self.start_stop_action.setToolTip("停止当前日志记录")
+            self.statusBar().showMessage("正在记录日志...")
+            # 更新窗口标题显示记录状态
+            if self.current_device:
+                self.setWindowTitle(f'Logmaster - {self.current_device.serial} [正在记录]')
+            else:
+                self.setWindowTitle('Logmaster - Android日志分析工具 [正在记录]')
+        else:
+            self.start_stop_action.setText("▶ 开始")
+            self.start_stop_action.setToolTip("开始记录新的日志")
+            self.statusBar().showMessage("日志记录已停止")
+            # 恢复窗口标题
+            self.setWindowTitle('Logmaster - Android日志分析工具')
+    
     def stop_logging(self):
         """停止日志记录"""
+        print("停止日志记录函数被调用")
+        
         if self.log_update_thread:
+            print("停止日志更新线程...")
             self.log_update_thread.stop()
             self.log_update_thread.wait()
             self.log_update_thread = None
             
+        print("停止logcat读取...")
         self.logcat_reader.stop_logcat()
         
         self.is_logging = False
-        self.start_stop_action.setText("▶ 开始")  # 恢复原始文字
-        self.start_stop_action.setToolTip("开始记录新的日志")
-        self.statusBar().showMessage("日志记录已停止")
-        # 恢复窗口标题
-        self.setWindowTitle('Logmaster - Android日志分析工具')
+        self.update_ui_for_logging_state(False)
+        
+        print("日志记录已停止")
         
     def get_filter_settings(self) -> dict:
         """获取过滤器设置"""
@@ -1126,37 +1201,63 @@ class LogMasterPro(QMainWindow):
             print(f"⚠️ macOS dock处理设置失败: {e}")
     
     def handle_sigterm(self, signum, frame):
-        """处理SIGTERM信号"""
+        """处理SIGTERM信号 - macOS dock退出"""
         print(f"收到SIGTERM信号 ({signum})，正在优雅退出...")
-        self.cleanup_before_exit()
-        QApplication.instance().quit()
+        try:
+            self.cleanup_before_exit()
+            # 使用quit而不是exit，避免异常退出
+            QApplication.instance().quit()
+        except Exception as e:
+            print(f"SIGTERM处理出错: {e}")
+            # 即使出错也要强制退出
+            QApplication.instance().quit()
     
     def handle_sigint(self, signum, frame):
-        """处理SIGINT信号"""
+        """处理SIGINT信号 - Ctrl+C"""
         print(f"收到SIGINT信号 ({signum})，正在优雅退出...")
-        self.cleanup_before_exit()
-        QApplication.instance().quit()
+        try:
+            self.cleanup_before_exit()
+            QApplication.instance().quit()
+        except Exception as e:
+            print(f"SIGINT处理出错: {e}")
+            QApplication.instance().quit()
     
     def cleanup_before_exit(self):
-        """退出前的清理工作"""
+        """退出前的清理工作 - 增强版"""
         print("执行清理工作...")
         try:
+            # 停止日志记录
             if self.is_logging:
                 print("停止日志记录...")
                 self.stop_logging()
             
+            # 停止设备监控
             if self.device_manager:
                 print("停止设备监控...")
                 self.device_manager.stop_monitoring()
             
+            # 停止日志更新线程
             if self.log_update_thread and self.log_update_thread.isRunning():
                 print("停止日志更新线程...")
                 self.log_update_thread.stop()
-                self.log_update_thread.wait(2000)  # 最多等待2秒
+                # 给线程一点时间来完成当前操作
+                if not self.log_update_thread.wait(1000):  # 最多等待1秒
+                    print("警告: 日志更新线程停止超时")
+                
+            # 停止过滤器定时器
+            if hasattr(self, 'filter_timer') and self.filter_timer.isActive():
+                print("停止过滤器定时器...")
+                self.filter_timer.stop()
+                
+            # 停止设备变化定时器
+            if hasattr(self, '_device_change_timer') and self._device_change_timer.isActive():
+                print("停止设备变化定时器...")
+                self._device_change_timer.stop()
                 
             print("清理完成")
         except Exception as e:
             print(f"清理过程中出错: {e}")
+            # 即使有错误也要继续退出，不要阻塞
         
     def show_about(self):
         """显示关于对话框"""
@@ -1234,8 +1335,12 @@ def main():
     # 设置信号处理
     def signal_handler(signum, frame):
         print(f"收到信号 {signum}，正在退出...")
-        window.cleanup_before_exit()
-        app.quit()
+        try:
+            window.cleanup_before_exit()
+            app.quit()
+        except Exception as e:
+            print(f"信号处理出错: {e}")
+            app.quit()  # 强制退出
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -1246,7 +1351,7 @@ def main():
         return exit_code
     except Exception as e:
         print(f"应用程序异常退出: {e}")
-        return 1
+        return 0  # 返回0而不是1，避免macOS认为是异常退出
 
 
 if __name__ == '__main__':

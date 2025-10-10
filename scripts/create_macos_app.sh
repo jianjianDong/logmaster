@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# LogMaster Pro - macOS启动器
+# LogMaster - macOS启动器
 # 这个脚本创建macOS应用包，支持点击图标启动
 
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-APP_NAME="LogMaster Pro"
+APP_NAME="LogMaster"
 APP_BUNDLE="$PROJECT_DIR/${APP_NAME}.app"
 
 # 颜色输出
@@ -16,7 +16,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}🚀 LogMaster Pro - macOS应用包创建器${NC}"
+echo -e "${GREEN}🚀 LogMaster - macOS应用包创建器${NC}"
 echo "=========================================="
 
 # 检查Python
@@ -52,11 +52,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>LogMaster Pro</string>
+    <string>LogMaster</string>
     <key>CFBundleDisplayName</key>
-    <string>LogMaster Pro</string>
+    <string>LogMaster</string>
     <key>CFBundleIdentifier</key>
-    <string>com.logmasterpro.app</string>
+    <string>com.logmaster.app</string>
     <key>CFBundleVersion</key>
     <string>5.0.0</string>
     <key>CFBundleShortVersionString</key>
@@ -72,9 +72,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2024 LogMaster Pro. All rights reserved.</string>
+    <string>Copyright © 2024 LogMaster. All rights reserved.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>LogMaster Pro需要访问系统事件来正常运行</string>
+    <string>LogMaster需要访问系统事件来正常运行</string>
 </dict>
 </plist>
 EOF
@@ -83,20 +83,17 @@ EOF
 cat > "$APP_BUNDLE/Contents/MacOS/LogMasterPro" << 'EOF'
 #!/bin/bash
 
-# LogMaster Pro 启动脚本
+# LogMaster 启动脚本
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
 # 设置Python路径
 export PYTHONPATH="$DIR/../Resources:$PYTHONPATH"
 
-# 检查ADB
-if ! command -v adb &> /dev/null; then
-    osascript -e 'display alert "ADB未找到" message "请确保Android SDK已安装并配置环境变量" buttons {"OK"} default button "OK"'
-    exit 1
-fi
+# 设置环境变量，确保ADB能被找到
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 
-# 启动应用
+# 启动应用（ADB检测将在应用内部处理）
 python3 "$DIR/../Resources/LogMasterPro.py" "$@"
 EOF
 
@@ -144,38 +141,44 @@ fi
 
 # 创建桌面快捷方式
 echo -e "${YELLOW}🔗 创建桌面快捷方式...${NC}"
-DESKTOP_LINK="$HOME/Desktop/LogMaster Pro.app"
+DESKTOP_LINK="$HOME/Desktop/LogMaster.app"
 rm -f "$DESKTOP_LINK"
 ln -s "$APP_BUNDLE" "$DESKTOP_LINK" 2>/dev/null || true
 
 # 创建Applications快捷方式
-APP_LINK="/Applications/LogMaster Pro.app"
+APP_LINK="/Applications/LogMaster.app"
 if [ -w "/Applications" ]; then
     rm -f "$APP_LINK"
     ln -s "$APP_BUNDLE" "$APP_LINK" 2>/dev/null || true
 fi
 
-# 测试运行
+# 测试运行 - 使用更轻量的测试方式
 echo -e "${GREEN}✅ 应用包创建完成！${NC}"
-echo -e "${YELLOW}🧪 测试运行...${NC}"
+echo -e "${YELLOW}🧪 验证应用包完整性...${NC}"
 
-# 尝试运行应用
-if "$APP_BUNDLE/Contents/MacOS/LogMasterPro" --version 2>/dev/null; then
-    echo -e "${GREEN}✅ 应用测试运行成功！${NC}"
+# 检查关键文件是否存在
+if [ -f "$APP_BUNDLE/Contents/MacOS/LogMasterPro" ] && [ -f "$APP_BUNDLE/Contents/Resources/LogMasterPro.py" ]; then
+    echo -e "${GREEN}✅ 应用包结构验证通过！${NC}"
+    # 只做语法检查，不实际运行应用
+    if python3 -m py_compile "$APP_BUNDLE/Contents/Resources/LogMasterPro.py" 2>/dev/null; then
+        echo -e "${GREEN}✅ Python语法检查通过！${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Python语法检查失败${NC}"
+    fi
 else
-    echo -e "${YELLOW}⚠️  应用测试运行失败，但包已创建完成${NC}"
+    echo -e "${RED}❌ 应用包结构不完整${NC}"
 fi
 
 echo ""
-echo -e "${GREEN}🎉 LogMaster Pro 应用包创建完成！${NC}"
+echo -e "${GREEN}🎉 LogMaster 应用包创建完成！${NC}"
 echo "=========================================="
 echo -e "📍 应用位置: ${APP_BUNDLE}"
 echo -e "💻 桌面快捷方式: ${DESKTOP_LINK}"
 echo -e "📱 Applications快捷方式: ${APP_LINK}"
 echo ""
 echo -e "${YELLOW}🚀 现在你可以：${NC}"
-echo "1. 双击桌面上的 'LogMaster Pro' 图标启动应用"
-echo "2. 或者在Applications文件夹中找到LogMaster Pro"
+echo "1. 双击桌面上的 'LogMaster' 图标启动应用"
+echo "2. 或者在Applications文件夹中找到LogMaster"
 echo "3. 或者从终端运行: open \"$APP_BUNDLE\""
 echo ""
-echo -e "${GREEN}享受使用LogMaster Pro！${NC}"
+echo -e "${GREEN}享受使用LogMaster！${NC}"

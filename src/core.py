@@ -126,8 +126,8 @@ class DeviceManager:
         
         self.devices = devices
     
-    def start_monitoring(self, interval: float = 1.0):
-        """开始监控设备连接状态"""
+    def start_monitoring(self, interval: float = 3.0):
+        """开始监控设备连接状态 - 降低频率避免过于敏感"""
         if self._running:
             return
             
@@ -137,10 +137,13 @@ class DeviceManager:
         self._monitor_thread.start()
     
     def stop_monitoring(self):
-        """停止监控设备连接状态"""
+        """停止监控设备连接状态 - 增强版"""
         self._running = False
         if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2)
+            # 给线程一个机会自然结束
+            self._monitor_thread.join(timeout=1)  # 减少等待时间
+            if self._monitor_thread.is_alive():
+                print("警告: 设备监控线程停止超时")
     
     def _monitor_devices(self, interval: float):
         """监控设备连接状态的线程函数"""
@@ -157,14 +160,39 @@ class DeviceManager:
     
     def _devices_changed(self, old_devices: List[Device], 
                         new_devices: List[Device]) -> bool:
-        """检查设备列表是否发生变化"""
+        """检查设备列表是否发生变化 - 增强版，忽略轻微状态波动"""
         if len(old_devices) != len(new_devices):
             return True
             
         old_serials = {d.serial for d in old_devices}
         new_serials = {d.serial for d in new_devices}
         
-        return old_serials != new_serials
+        # 检查是否有真正的设备增减，而不是状态变化
+        if old_serials != new_serials:
+            return True
+            
+        # 检查设备状态是否有重大变化，忽略轻微的状态波动
+        old_status = {d.serial: d.status for d in old_devices}
+        new_status = {d.serial: d.status for d in new_devices}
+        
+        for serial in old_serials:
+            old_stat = old_status.get(serial)
+            new_stat = new_status.get(serial)
+            
+            if old_stat != new_stat:
+                # 只有当状态发生实质性变化时才认为有变化
+                # 忽略: device <-> host, device <-> recovery 等轻微波动
+                # 只关注: device <-> offline, device <-> unauthorized 等重大变化
+                significant_changes = [
+                    ('device', 'offline'), ('offline', 'device'),
+                    ('device', 'unauthorized'), ('unauthorized', 'device'),
+                    ('offline', 'unauthorized'), ('unauthorized', 'offline')
+                ]
+                
+                if (old_stat, new_stat) in significant_changes:
+                    return True
+        
+        return False
     
     def _handle_device_change(self, old_devices: List[Device], 
                              new_devices: List[Device]):
@@ -176,9 +204,18 @@ class DeviceManager:
         disconnected = old_serials - new_serials
         
         if connected:
-            print(f"设备连接: {connected}")
+            print(f"🔄 设备连接: {connected}")
         if disconnected:
-            print(f"设备断开: {disconnected}")
+            print(f"🔄 设备断开: {disconnected}")
+        
+        # 如果有设备变化，通知回调函数
+        if connected or disconnected:
+            print(f"📊 设备变化统计 - 连接: {len(connected)}, 断开: {len(disconnected)}")
+            for callback in self._callbacks:
+                try:
+                    callback(new_devices)
+                except Exception as e:
+                    print(f"设备变化回调执行错误: {e}")
     
     def is_adb_available(self) -> bool:
         """检查ADB是否可用"""
