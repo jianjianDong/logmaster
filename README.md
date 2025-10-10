@@ -56,7 +56,7 @@ python3 LogMasterPro.py
 #### 方法2: 创建macOS应用（推荐）
 ```bash
 ./scripts/create_macos_app.sh
-# 然后在Applications文件夹中找到LogMaster Pro
+# 然后在Applications文件夹中找到LogMaster
 ```
 
 #### 方法3: 使用启动脚本
@@ -190,18 +190,11 @@ python3 tests/test_functionality.py
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/) - 强大的GUI框架
 - [Android Debug Bridge](https://developer.android.com/studio/command-line/adb) - Android调试工具
 
-## 📞 支持与联系
-
-- 💬 **Issues**: [GitHub Issues](https://github.com/yourusername/LogMasterPro/issues)
-- 📧 **Email**: your.email@example.com
-- 🌐 **Website**: https://logmasterpro.com
-
----
 
 <div align="center">
 
 **⭐ 如果这个项目对你有帮助，请给它一个星！** 
 
-Made with ❤️ by [Your Name](https://github.com/yourusername)
+Made with ❤️ by [Your Name](https://github.com/jianjianDong)
 
 </div>
