@@ -592,17 +592,23 @@ class LogcatReader:
                 f.write(f"LogMaster Pro - Android日志\n")
                 f.write(f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 80 + "\n")
-                f.write(f"设备: {logs[0].device_serial if logs else 'Unknown'}\n")
+                device_serial = getattr(logs[0], 'device_serial', 'Unknown') if logs else 'Unknown'
+                f.write(f"设备: {device_serial}\n")
                 f.write(f"日志数量: {len(logs)}\n")
                 f.write("=" * 80 + "\n\n")
                 
                 for log_entry in logs:
-                    f.write(f"{log_entry.raw_line}\n")
+                    if hasattr(log_entry, 'raw_line'):
+                        f.write(f"{log_entry.raw_line}\n")
+                    else:
+                        f.write(f"{log_entry}\n")
                     
             print(f"日志保存成功: {filename} ({len(logs)} 条)")
             return True
         except Exception as e:
             print(f"保存日志文件失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get_stats(self):
