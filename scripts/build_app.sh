@@ -49,7 +49,14 @@ echo "这可能需要几分钟时间，请耐心等待..."
 PYINSTALLER_CMD="pyinstaller --noconfirm --clean \
     --windowed \
     --name \"LogMasterPro\" \
-    --add-data \"src:src\""
+    --add-data \"src:src\" \
+    --hidden-import \"PyQt5\" \
+    --hidden-import \"PyQt5.sip\" \
+    --hidden-import \"PyQt5.QtCore\" \
+    --hidden-import \"PyQt5.QtGui\" \
+    --hidden-import \"PyQt5.QtWidgets\" \
+    --hidden-import \"PyQt5.QtNetwork\" \
+    --hidden-import \"PyQt5.QtPrintSupport\""
 
 if [ -n "$ICON_PATH" ]; then
     PYINSTALLER_CMD="$PYINSTALLER_CMD --icon \"$ICON_PATH\""

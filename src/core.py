@@ -70,46 +70,89 @@ class DeviceManager:
             except Exception as e:
                 print(f"回调函数执行错误: {e}")
     
+    def _get_adb_path(self) -> str:
+        """获取 adb 的真实绝对路径（极其健壮的查找方式）"""
+        # 如果已经缓存了路径，直接返回，避免频繁执行子进程和路径探测
+        if hasattr(self.__class__, '_cached_adb_path') and self.__class__._cached_adb_path:
+            return self.__class__._cached_adb_path
+            
+        adb_cmd = 'adb'
+        
+        # 1. 如果在正常的 PATH 中能找到，直接返回
+        if not getattr(sys, 'frozen', False) and self._is_command_in_path('adb'):
+            self.__class__._cached_adb_path = adb_cmd
+            return adb_cmd
+            
+        # 2. 如果打包成了 App，尝试智能探测
+        home = os.path.expanduser('~')
+        
+        # 将环境变量里的路径和常见路径全部罗列
+        candidates = [
+            os.path.join(os.environ.get('ANDROID_HOME', ''), 'platform-tools', 'adb'),
+            os.path.join(os.environ.get('ANDROID_SDK_ROOT', ''), 'platform-tools', 'adb'),
+            os.path.join(home, 'Library/Android/sdk/platform-tools/adb'),
+            '/usr/local/bin/adb',
+            '/opt/homebrew/bin/adb',
+            '/opt/local/bin/adb',
+            '/usr/bin/adb',
+            '/bin/adb'
+        ]
+        
+        # 3. 尝试通过 Mac 的 /usr/libexec/path_helper 获取完整 PATH 然后找
+        # 这是一个耗时操作，尽量放在后面
+        try:
+            path_helper_out = subprocess.check_output(['/usr/libexec/path_helper', '-s'], text=True).strip()
+            # path_helper_out 格式类似于: PATH="/usr/local/bin:/usr/bin:/bin"; export PATH;
+            if 'PATH="' in path_helper_out:
+                path_str = path_helper_out.split('PATH="')[1].split('"')[0]
+                for p in path_str.split(':'):
+                    candidates.append(os.path.join(p, 'adb'))
+        except:
+            pass
+
+        # 清洗候选列表，去除空值
+        candidates = [p for p in candidates if p]
+
+        # 验证哪个路径真正存在且是可执行的
+        for p in candidates:
+            if os.path.exists(p) and os.access(p, os.X_OK):
+                self.__class__._cached_adb_path = p
+                return p
+                
+        # 4. 最后杀手锏：尝试通过用户的 shell 配置里找 (最耗时)
+        try:
+            shell = os.environ.get('SHELL', '/bin/zsh')
+            # 启动一个交互式的 shell 并立刻打印 adb 的 which 结果
+            which_adb = subprocess.check_output([shell, '-i', '-c', 'which adb'], stderr=subprocess.DEVNULL, text=True).strip()
+            if which_adb and "not found" not in which_adb:
+                if os.path.exists(which_adb) and os.access(which_adb, os.X_OK):
+                    self.__class__._cached_adb_path = which_adb
+                    return which_adb
+        except:
+            pass
+
+        self.__class__._cached_adb_path = adb_cmd
+        return adb_cmd
+
     def get_devices(self, notify=True) -> List[Device]:
         """获取当前连接的设备列表"""
         try:
-            # First try adb devices
-            result = subprocess.run(['adb', 'devices', '-l'], 
-                                  capture_output=True, text=True, timeout=5)
-            
-            # If adb is not found or fails, try looking for it in common locations
-            if result.returncode != 0:
-                adb_path = ''
-                if os.environ.get('ANDROID_HOME'):
-                    adb_path = os.path.join(os.environ.get('ANDROID_HOME'), 'platform-tools', 'adb')
-                elif os.environ.get('ANDROID_SDK_ROOT'):
-                    adb_path = os.path.join(os.environ.get('ANDROID_SDK_ROOT'), 'platform-tools', 'adb')
-                else:
-                    home = os.path.expanduser('~')
-                    common_paths = [
-                        os.path.join(home, 'Library/Android/sdk/platform-tools/adb'),
-                        '/usr/local/bin/adb',
-                        '/opt/homebrew/bin/adb'
-                    ]
-                    for p in common_paths:
-                        if os.path.exists(p):
-                            adb_path = p
-                            break
-                            
-                if adb_path and os.path.exists(adb_path):
-                    result = subprocess.run([adb_path, 'devices', '-l'], 
-                                          capture_output=True, text=True, timeout=5)
+            adb_cmd = self._get_adb_path()
+
+            # 将超时时间从 5 秒缩短到 2 秒，避免阻塞太久
+            result = subprocess.run([adb_cmd, 'devices', '-l'], 
+                                  capture_output=True, text=True, timeout=2)
 
             if result.returncode == 0:
                 self._parse_devices_output(result.stdout)
             else:
-                print(f"ADB命令执行失败: {result.stderr}")
+                print(f"ADB命令执行失败 ({adb_cmd}): {result.stderr}")
                 self.devices = []
         except subprocess.TimeoutExpired:
             print("ADB命令超时")
             self.devices = []
         except FileNotFoundError:
-            print("未找到ADB命令，请确保Android SDK已安装并配置环境变量")
+            print(f"未找到ADB命令 ({adb_cmd})，请确保Android SDK已安装并配置环境变量")
             self.devices = []
         except Exception as e:
             print(f"获取设备列表时出错: {e}")
@@ -118,6 +161,11 @@ class DeviceManager:
         if notify:
             self._notify_callbacks()
         return self.devices
+        
+    def _is_command_in_path(self, cmd: str) -> bool:
+        """检查命令是否在环境变量 PATH 中"""
+        import shutil
+        return shutil.which(cmd) is not None
     
     def _parse_devices_output(self, output: str):
         """解析adb devices -l的输出"""
@@ -247,7 +295,8 @@ class DeviceManager:
     def is_adb_available(self) -> bool:
         """检查ADB是否可用"""
         try:
-            result = subprocess.run(['adb', 'version'], 
+            adb_cmd = self._get_adb_path()
+            result = subprocess.run([adb_cmd, 'version'], 
                                   capture_output=True, text=True, timeout=3)
             return result.returncode == 0
         except:
@@ -256,7 +305,8 @@ class DeviceManager:
     def get_adb_version(self) -> Optional[str]:
         """获取ADB版本"""
         try:
-            result = subprocess.run(['adb', 'version'], 
+            adb_cmd = self._get_adb_path()
+            result = subprocess.run([adb_cmd, 'version'], 
                                   capture_output=True, text=True, timeout=3)
             if result.returncode == 0:
                 # 解析版本信息
@@ -271,7 +321,8 @@ class DeviceManager:
 
 class LogcatReader:
     """日志读取器"""
-    def __init__(self):
+    def __init__(self, device_manager=None):
+        self.device_manager = device_manager
         self.process: Optional[subprocess.Popen] = None
         self._read_thread: Optional[threading.Thread] = None
         self._running = False
@@ -322,8 +373,17 @@ class LogcatReader:
             for key, value in filters.items():
                 self._filters[key] = value
         
+        # 统一使用最健壮的 ADB 路径探测逻辑，不再硬编码重复写
+        adb_cmd = 'adb'
+        if hasattr(self, 'device_manager') and self.device_manager:
+             adb_cmd = self.device_manager._get_adb_path()
+        else:
+             # 因为 LogcatReader 初始化时没有传入 device_manager，我们借用一下现成的逻辑
+             temp_dm = DeviceManager()
+             adb_cmd = temp_dm._get_adb_path()
+
         # 构建adb logcat命令 - 简化命令，避免复杂参数
-        cmd = ['adb', '-s', device_serial, 'logcat', '-v', 'threadtime']
+        cmd = [adb_cmd, '-s', device_serial, 'logcat', '-v', 'threadtime']
         
         # 应用级别过滤器
         if self._filters['level']:
@@ -386,7 +446,14 @@ class LogcatReader:
     def _clear_logcat_buffer(self, device_serial: str):
         """清除logcat缓冲区"""
         try:
-            result = subprocess.run(['adb', '-s', device_serial, 'logcat', '-c'], 
+            adb_cmd = 'adb'
+            if hasattr(self, 'device_manager') and self.device_manager:
+                 adb_cmd = self.device_manager._get_adb_path()
+            else:
+                 temp_dm = DeviceManager()
+                 adb_cmd = temp_dm._get_adb_path()
+                 
+            result = subprocess.run([adb_cmd, '-s', device_serial, 'logcat', '-c'], 
                                    capture_output=True, timeout=5)
             print(f"清除缓冲区结果: {result.returncode}")
         except Exception as e:
@@ -403,14 +470,28 @@ class LogcatReader:
         max_consecutive_errors = 10
         
         try:
-            while self._running and self.process.poll() is None:
+            while self._running:
+                # 检查进程是否退出
+                if self.process.poll() is not None:
+                    print(f"ADB logcat进程意外退出, 退出码: {self.process.poll()}")
+                    # 尝试读取一下标准错误看看发生了什么
+                    if self.process.stderr:
+                        stderr_output = self.process.stderr.read()
+                        if stderr_output:
+                            print(f"ADB logcat错误输出: {stderr_output}")
+                            
+                    # 将 _running 设为 False，触发外部的自动重启或停止逻辑
+                    self._running = False
+                    break
+                    
                 try:
                     line = self.process.stdout.readline()
                     if not line:
-                        # 如果连续10次都读到空行，认为进程可能有问题
+                        # 如果连续多次都读到空行，认为进程可能有问题
                         consecutive_errors += 1
                         if consecutive_errors >= max_consecutive_errors:
-                            print(f"连续{max_consecutive_errors}次读取空行，可能进程异常")
+                            print(f"连续{max_consecutive_errors}次读取空行，可能进程异常，设为不运行")
+                            self._running = False
                             break
                         time.sleep(0.01)  # 短暂等待，避免CPU占用过高
                         continue

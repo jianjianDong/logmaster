@@ -7,6 +7,26 @@ LogMaster Pro - Android日志大师
 import sys
 import os
 import signal
+import time
+
+# Always redirect stdout and stderr when frozen to avoid any console-related crashes
+if getattr(sys, 'frozen', False):
+    try:
+        sys.stdout = open('/tmp/logmaster_stdout.log', 'w', buffering=1)
+        sys.stderr = open('/tmp/logmaster_stderr.log', 'w', buffering=1)
+    except Exception as e:
+        pass
+
+# 增加调试信息收集
+with open('/tmp/logmaster_debug.log', 'w') as f:
+    f.write(f"sys.frozen: {getattr(sys, 'frozen', False)}\n")
+    f.write(f"sys.executable: {sys.executable}\n")
+    f.write(f"sys.argv: {sys.argv}\n")
+    f.write(f"sys.path: {sys.path}\n")
+    f.write(f"os.getcwd(): {os.getcwd()}\n")
+    f.write(f"sys.stdout: {repr(getattr(sys, 'stdout', None))}\n")
+    if getattr(sys, 'frozen', False):
+        f.write(f"sys._MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
 
 # 将src目录添加到Python路径
 if getattr(sys, 'frozen', False):

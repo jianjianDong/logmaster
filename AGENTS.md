@@ -145,6 +145,9 @@ python3 test_autoscroll_fix.py
 python3 test_pid_filter_autoscroll.py
 ```
 
+### GUI Application Testing Guidelines
+对于GUI应用程序，由于主循环（EventLoop）会一直保持运行并阻塞终端进程，直接用同步的Bash命令去拉起它确实容易导致进程被卡住等待。对于这类测试，后续使用后台运行的方式（例如 `run_in_background: true` 或者使用 `&` 并把输出重定向到文件）来进行测试。
+
 ### Key Test Areas
 - Device detection and connection handling
 - Log filtering accuracy (regex, multi-tag)

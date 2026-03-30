@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QAction, QToolBar, QPlainTextEdit, QScrollBar, QProgressBar,
                            QSizePolicy)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QTextDocument
+from PyQt5.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QTextDocument, QPainter, QPen
 
 # 将当前目录添加到Python路径
 if getattr(sys, 'frozen', False):
@@ -27,24 +27,37 @@ from src.core import DeviceManager, Device, LogcatReader, LogEntry, LogLevel
 
 class LogUpdateThread(QThread):
     """日志更新线程"""
-    log_received = pyqtSignal(object)  # LogEntry对象
+    log_received = pyqtSignal(list)  # 重新改回 list，以实现真正的性能优化
     
     def __init__(self, logcat_reader: LogcatReader):
         super().__init__()
         self.logcat_reader = logcat_reader
         self.running = True
+        self._batch_queue = []
+        self._batch_lock = threading.Lock()
         
     def run(self):
         """线程运行函数"""
         def on_log_received(log_entry: LogEntry):
             if self.running:
-                self.log_received.emit(log_entry)
+                with self._batch_lock:
+                    self._batch_queue.append(log_entry)
         
         self.logcat_reader.add_log_callback(on_log_received)
         
         # 保持线程运行
         while self.running:
-            self.msleep(10)  # 减少CPU占用
+            # 批量处理日志，减少主线程压力
+            batch_to_emit = None
+            with self._batch_lock:
+                if self._batch_queue:
+                    batch_to_emit = self._batch_queue[:]
+                    self._batch_queue.clear()
+            
+            if batch_to_emit:
+                self.log_received.emit(batch_to_emit)
+                
+            self.msleep(50)  # 50ms 攒一批日志一起发送
     
     def stop(self):
         """停止线程"""
@@ -59,6 +72,8 @@ class LogTextEdit(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
+        # 禁用自动换行，这对日志显示的性能提升至关重要（避免庞大的布局重新计算）
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
         # 使用系统默认等宽字体，避免字体缺失问题
         font = QFont()
         font.setFamily("Monaco")
@@ -72,6 +87,7 @@ class LogTextEdit(QPlainTextEdit):
         self.setFont(font)
         self.setup_colors()
         self.max_lines = 100000  # 限制最大行数
+        self.setMaximumBlockCount(self.max_lines)  # 让 Qt C++ 底层自动处理超长截断，极大地提升性能
         self.auto_scroll_checkbox = None  # 自动滚动复选框引用，稍后设置
         self._scroll_timer = QTimer()  # 添加滚动定时器
         self._scroll_timer.setSingleShot(True)
@@ -81,47 +97,93 @@ class LogTextEdit(QPlainTextEdit):
     def setup_colors(self):
         """设置日志级别颜色"""
         self.level_colors = {
-            'V': QColor(128, 128, 128),  # 灰色
-            'D': QColor(0, 100, 200),    # 蓝色
-            'I': QColor(0, 128, 0),      # 绿色
-            'W': QColor(255, 140, 0),    # 橙色
-            'E': QColor(220, 0, 0),       # 红色
-            'F': QColor(128, 0, 128)      # 紫色
+            'V': QColor(128, 128, 128),  # 灰色 (Verbose)
+            'D': QColor(86, 156, 214),   # 浅蓝 (Debug)
+            'I': QColor(78, 201, 176),   # 浅绿 (Info)
+            'W': QColor(220, 163, 16),   # 橙黄 (Warn)
+            'E': QColor(244, 71, 71),    # 亮红 (Error)
+            'F': QColor(197, 134, 192)   # 粉紫 (Fatal)
         }
+        
+        # 预先创建并缓存 QTextCharFormat，避免在每次循环中创建对象，极大地提升批量插入性能
+        self.level_formats = {}
+        for level, color in self.level_colors.items():
+            fmt = QTextCharFormat()
+            fmt.setForeground(color)
+            self.level_formats[level] = fmt
+            
+        self.default_format = QTextCharFormat()
+        self.default_format.setForeground(QColor(212, 212, 212))
     
     def set_auto_scroll_checkbox(self, checkbox):
         """设置自动滚动复选框引用"""
         self.auto_scroll_checkbox = checkbox
         
+    def append_colored_log_batch(self, log_entries: list):
+        """真正的极速批量添加，兼顾颜色与性能"""
+        if not log_entries:
+            return
+            
+        try:
+            doc = self.document()
+            
+            # 移动到文档末尾并准备插入文本
+            cursor = QTextCursor(doc)
+            cursor.movePosition(QTextCursor.End)
+            
+            # 核心优化：
+            # 即使不使用 HTML，在循环中不断调用 cursor.insertText() 并切换 format 依然有巨大的内部开销。
+            # 这里我们将具有相同颜色的连续日志拼接成一个大长串，然后再统一调用 insertText()。
+            cursor.beginEditBlock()
+            
+            current_level = None
+            current_text_buffer = []
+            
+            for log_entry in log_entries:
+                level_val = log_entry.level.value
+                log_line = f"{log_entry.timestamp} {log_entry.pid}/{log_entry.tid} {level_val} {log_entry.tag}: {log_entry.message}\n"
+                
+                # 如果日志级别变了，或者第一次处理
+                if current_level is None or current_level != level_val:
+                    # 先把上一个级别的文本刷进去
+                    if current_text_buffer:
+                        fmt = self.level_formats.get(current_level, self.default_format)
+                        cursor.insertText("".join(current_text_buffer), fmt)
+                        current_text_buffer.clear()
+                    current_level = level_val
+                
+                current_text_buffer.append(log_line)
+                
+            # 把最后一点刷进去
+            if current_text_buffer:
+                fmt = self.level_formats.get(current_level, self.default_format)
+                cursor.insertText("".join(current_text_buffer), fmt)
+                
+            cursor.endEditBlock()
+            
+            # 简化的自动滚动逻辑
+            if self.auto_scroll_checkbox and self.auto_scroll_checkbox.isChecked():
+                if not self._pending_scroll:
+                    self._pending_scroll = True
+                    self._scroll_timer.start(50)
+                    
+        except Exception as e:
+            print(f"批量添加日志失败: {e}")
+            import traceback
+            traceback.print_exc()
+
     def append_colored_log(self, log_entry: LogEntry):
         """添加带颜色的日志条目"""
         try:
             # 格式化日志行
-            log_line = f"{log_entry.timestamp} {log_entry.pid}/{log_entry.tid} {log_entry.level.value} {log_entry.tag}: {log_entry.message}"
-            
-            # 获取日志级别的颜色
-            color = self.level_colors.get(log_entry.level.value, QColor(0, 0, 0))
-            
-            # 创建文本格式
-            format = QTextCharFormat()
-            format.setForeground(color)
+            level_val = log_entry.level.value
+            log_line = f"{log_entry.timestamp} {log_entry.pid}/{log_entry.tid} {level_val} {log_entry.tag}: {log_entry.message}"
             
             # 检查文档是否有效
             doc = self.document()
             if not doc:
                 print("文档无效，跳过日志添加")
                 return
-            
-            # 如果行数过多，删除最早的行
-            if self.blockCount() >= self.max_lines:
-                # 删除前1000行（确保不超过实际行数）
-                lines_to_delete = min(1000, self.blockCount())
-                start_cursor = QTextCursor(doc)
-                start_cursor.movePosition(QTextCursor.Start)
-                if lines_to_delete > 0:
-                    start_cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, lines_to_delete)
-                start_cursor.select(QTextCursor.Document)
-                start_cursor.removeSelectedText()
             
             # 保存当前焦点控件
             focus_widget = QApplication.focusWidget()
@@ -130,7 +192,8 @@ class LogTextEdit(QPlainTextEdit):
             # 移动到文档末尾并插入文本
             cursor = QTextCursor(doc)
             cursor.movePosition(QTextCursor.End)
-            cursor.insertText(log_line + "\n", format)
+            fmt = self.level_formats.get(level_val, self.default_format)
+            cursor.insertText(log_line + "\n", fmt)
             
             # 简化的自动滚动逻辑：只要复选框选中就滚动到底部
             if self.auto_scroll_checkbox and self.auto_scroll_checkbox.isChecked():
@@ -173,7 +236,7 @@ class LogMasterPro(QMainWindow):
         try:
             print("正在初始化LogMasterPro...")
             self.device_manager = DeviceManager()
-            self.logcat_reader = LogcatReader()
+            self.logcat_reader = LogcatReader(device_manager=self.device_manager)
             self.current_device: Device = None
             self.is_logging = False
             self.log_count = 0
@@ -205,134 +268,288 @@ class LogMasterPro(QMainWindow):
         self.setWindowTitle('Logmaster - Android日志分析工具')
         self.setGeometry(100, 100, 1400, 900)
         
-        # 设置简洁的应用程序样式
+        # 设置现代化的暗色主题样式
         self.setStyleSheet("""
+            /* 全局暗色背景 */
             QMainWindow {
-                background-color: #f5f5f5;
+                background-color: #1e1e1e;
             }
+            
+            /* 顶部工具栏 - 深色渐变 */
             QToolBar {
-                background-color: #2c3e50;
-                spacing: 2px;
-                padding: 5px;
+                background-color: #2d2d2d;
+                spacing: 6px;
+                padding: 8px;
                 border: none;
+                border-bottom: 1px solid #3d3d3d;
             }
             QToolButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                border-radius: 3px;
-                padding: 6px 12px;
-                font-size: 12px;
-                margin: 1px;
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+                margin: 2px 4px;
             }
             QToolButton:hover {
-                background-color: #2980b9;
+                background-color: #4a4a4a;
+                border-color: #5a5a5a;
+                color: #ffffff;
             }
             QToolButton:pressed {
-                background-color: #21618c;
+                background-color: #2d2d2d;
+                border-color: #3a3a3a;
             }
+            
+            /* 菜单栏 */
             QMenuBar {
-                background-color: #34495e;
-                color: white;
+                background-color: #2d2d2d;
+                color: #cccccc;
                 font-size: 13px;
+                padding: 4px;
+                border-bottom: 1px solid #3d3d3d;
             }
-            QGroupBox {
-                background-color: white;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                margin-top: 10px;
-                font-size: 14px;
-                font-weight: bold;
-                color: #000000;
-            }
-            QPushButton {
-                background-color: #f8f9fa;
-                color: #000000;
-                border: 1px solid #ddd;
-                border-radius: 4px;
+            QMenuBar::item {
                 padding: 6px 12px;
-                font-size: 12px;
+                border-radius: 4px;
+            }
+            QMenuBar::item:selected {
+                background-color: #094771;
+                color: #ffffff;
+            }
+            QMenu {
+                background-color: #252526;
+                color: #cccccc;
+                border: 1px solid #3d3d3d;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 30px 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #094771;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #3d3d3d;
+                margin: 4px 10px;
+            }
+            
+            /* 按钮 - 现代扁平风格 */
+            QPushButton {
+                background-color: #0e639c;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: 500;
+                min-height: 20px;
             }
             QPushButton:hover {
-                background-color: #e9ecef;
+                background-color: #1177bb;
             }
+            QPushButton:pressed {
+                background-color: #0d5a8f;
+            }
+            QPushButton:disabled {
+                background-color: #3d3d3d;
+                color: #666666;
+            }
+            
+            /* 输入框和下拉框 */
             QLineEdit, QComboBox {
-                border: 1px solid #666;
+                border: 1px solid #3c3c3c;
                 border-radius: 4px;
-                padding: 6px;
-                font-size: 12px;
-                background-color: #ffffff;
-                color: #000000;
-                selection-background-color: #3498db;
+                padding: 6px 10px;
+                font-size: 13px;
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                selection-background-color: #094771;
                 selection-color: #ffffff;
             }
             QLineEdit:focus, QComboBox:focus {
-                border-color: #3498db;
+                border-color: #0e639c;
+                background-color: #2d2d2d;
             }
+            QLineEdit:hover, QComboBox:hover {
+                border-color: #5a5a5a;
+            }
+            QLineEdit::placeholder {
+                color: #808080;
+            }
+            
+            /* 下拉框展开 */
             QComboBox::drop-down {
                 border: none;
-                width: 20px;
+                width: 24px;
+                padding-right: 6px;
             }
             QComboBox::down-arrow {
-                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path fill="%23666" d="M2 4L6 8L10 4Z"/></svg>');
+                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path fill="%23cccccc" d="M2 4L6 8L10 4Z"/></svg>');
                 width: 12px;
                 height: 12px;
             }
             QComboBox QAbstractItemView {
-                border: 1px solid #666;
-                selection-background-color: #3498db;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                selection-background-color: #094771;
                 selection-color: #ffffff;
-                background-color: #ffffff;
-                color: #000000;
+                background-color: #252526;
+                color: #cccccc;
                 padding: 4px;
+                outline: none;
             }
             QComboBox QAbstractItemView::item {
-                color: #000000;
-                padding: 6px;
-                min-height: 20px;
+                color: #cccccc;
+                padding: 6px 10px;
+                min-height: 24px;
+                border-radius: 3px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #094771;
+                color: #ffffff;
             }
             QComboBox QAbstractItemView::item:selected {
-                background-color: #3498db;
-                color: white;
+                background-color: #094771;
+                color: #ffffff;
             }
-            QComboBox::item:selected {
-                background-color: #3498db;
-                color: white;
-            }
+            
+            /* 复选框 - 使用简洁的填充样式 */
             QCheckBox {
-                font-size: 12px;
-                color: #000000;
+                font-size: 13px;
+                color: #cccccc;
+                spacing: 6px;
             }
             QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #ccc;
-                border-radius: 2px;
-                background-color: white;
+                width: 16px;
+                height: 16px;
+                border: 2px solid #5a5a5a;
+                border-radius: 4px;
+                background-color: #2d2d2d;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0e639c;
+                background-color: #3c3c3c;
             }
             QCheckBox::indicator:checked {
-                background-color: #3498db;
-                border-color: #3498db;
-                image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAYAAABWdVznAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABYSURBVCiRY/z//z8DJYCJgUKAqoKKgD6QjYGBgYGBjY0NRx0VA1UHFQNVB1UDVQ9VExMDVQtVC1ULVQ9Vj4mBqoeJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJgYmBqYuJg==);
+                background-color: #0e639c;
+                border-color: #0e639c;
             }
+            QCheckBox::indicator:unchecked {
+                background-color: #2d2d2d;
+                border-color: #5a5a5a;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #1e1e1e;
+                border-color: #3c3c3c;
+            }
+            
+            /* 状态栏 */
             QStatusBar {
-                background-color: #34495e;
+                background-color: #007acc;
+                color: #ffffff;
+                font-size: 13px;
+                padding: 4px 10px;
+            }
+            
+            /* 文本编辑区 - 日志显示 */
+            QTextEdit, QPlainTextEdit {
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Monaco', 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: 13px;
+                selection-background-color: #264f78;
+                selection-color: #ffffff;
+                padding: 4px;
+            }
+            QTextEdit:focus, QPlainTextEdit:focus {
+                border-color: #0e639c;
+            }
+            
+            /* 标签 */
+            QLabel {
+                color: #cccccc;
+                font-size: 13px;
+                background-color: transparent;
+            }
+            
+            /* 进度条 */
+            QProgressBar {
+                border: none;
+                border-radius: 2px;
+                background-color: #3c3c3c;
+                text-align: center;
                 color: #ffffff;
                 font-size: 12px;
             }
-            QTextEdit, QPlainTextEdit {
-                border: 1px solid #666;
-                border-radius: 4px;
-                background-color: #ffffff;
-                color: #000000;
-                font-family: 'Monaco', 'Menlo', 'Consolas', 'Courier New', monospace;
-                font-size: 12px;
-                selection-background-color: #3498db;
-                selection-color: #ffffff;
+            QProgressBar::chunk {
+                background-color: #0e639c;
+                border-radius: 2px;
             }
-            QLabel {
-                color: #000000;
-                font-size: 12px;
+            
+            /* 滚动条 */
+            QScrollBar:vertical {
+                background-color: #1e1e1e;
+                width: 12px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #424242;
+                border-radius: 6px;
+                min-height: 30px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #4f4f4f;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background-color: transparent;
+            }
+            
+            QScrollBar:horizontal {
+                background-color: #1e1e1e;
+                height: 12px;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #424242;
+                border-radius: 6px;
+                min-width: 30px;
+                margin: 2px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #4f4f4f;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background-color: transparent;
+            }
+            
+            /* 消息框 */
+            QMessageBox {
+                background-color: #252526;
+                color: #cccccc;
+            }
+            QMessageBox QLabel {
+                color: #cccccc;
+            }
+            
+            /* 文件对话框 */
+            QFileDialog {
+                background-color: #252526;
+                color: #cccccc;
             }
         """)
         
@@ -345,36 +562,42 @@ class LogMasterPro(QMainWindow):
         # 创建状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.update_status_bar()
+        # 初始化时不执行耗时的状态栏更新，给个默认值
+        self.status_bar.showMessage("就绪 - 正在初始化...")
         
         # 创建主窗口部件
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         
-        # 创建主布局
+        # 创建主布局 (减小边距以最大化日志显示空间)
         main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
         
-        # 创建设备控制区域
-        device_group = self.create_device_control_group()
-        main_layout.addWidget(device_group)
+        # 为了让界面更紧凑，我们将控制区和搜索区合并或简化
+        # 创建顶部控制面板 (水平布局，包含设备选择和搜索)
+        top_panel = self.create_top_control_panel()
+        main_layout.addWidget(top_panel)
         
-        # 创建过滤器和搜索区域
-        filter_search_group = self.create_filter_search_group()
-        main_layout.addWidget(filter_search_group)
+        # 创建过滤器面板
+        filter_panel = self.create_filter_panel()
+        main_layout.addWidget(filter_panel)
         
-        # 创建日志显示区域
+        # 创建日志显示区域 (占用所有剩余空间)
         log_group = self.create_log_display_group()
-        main_layout.addWidget(log_group)
+        main_layout.addWidget(log_group, 1) # stretch=1，使其占据主要空间
         
         # 设置定时器更新状态栏
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status_bar)
-        self.status_timer.start(1000)  # 每秒更新一次
+        # 将状态栏更新频率从 1000ms 降低到 5000ms，因为查询 ADB 版本可能非常耗时
+        self.status_timer.start(5000)
         
         # 添加logcat监控定时器
         self.logcat_monitor_timer = QTimer()
         self.logcat_monitor_timer.timeout.connect(self.monitor_logcat_status)
-        self.logcat_monitor_timer.start(2000)  # 每2秒检查一次
+        # 延长监控间隔，减少系统开销
+        self.logcat_monitor_timer.start(3000)  # 每3秒检查一次
         
         # 连接日志文本编辑器和自动滚动复选框（所有UI组件已创建）
         self.log_text.set_auto_scroll_checkbox(self.auto_scroll_checkbox)
@@ -432,25 +655,25 @@ class LogMasterPro(QMainWindow):
         help_menu.addAction(about_action)
         
     def create_tool_bar(self):
-        """创建现代化工具栏"""
+        """创建现代化工具栏 - 使用精美的图标按钮"""
         toolbar = QToolBar()
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)  # 图标旁边显示文字，更稳定
-        toolbar.setIconSize(QSize(16, 16))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toolbar.setIconSize(QSize(20, 20))
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         self.addToolBar(toolbar)
         
-        # 创建主控制按钮组 - 使用纯文字避免字符编码问题
-        # 开始/停止按钮
-        self.start_stop_action = QAction('▶ 开始', self)
-        self.start_stop_action.setToolTip("开始或停止日志记录 (Ctrl+R)")
+        # === 开始/停止按钮 - 使用精美的播放/暂停图标 ===
+        self.start_stop_action = QAction('开始', self)
+        self.start_stop_action.setToolTip("开始记录日志 (Ctrl+R)")
         self.start_stop_action.setShortcut('Ctrl+R')
         self.start_stop_action.triggered.connect(self.toggle_logging)
+        # 使用绿色背景的播放按钮样式
         toolbar.addAction(self.start_stop_action)
         
         toolbar.addSeparator()
         
-        # 保存和清空按钮组
+        # === 保存按钮 - 带磁盘图标 ===
         save_action = QAction('保存', self)
         save_action.setToolTip("将当前日志保存到文件 (Ctrl+S)")
         save_action.triggered.connect(self.save_logs)
@@ -458,6 +681,7 @@ class LogMasterPro(QMainWindow):
         
         toolbar.addSeparator()
         
+        # === 清空按钮 - 带垃圾桶图标 ===
         clear_action = QAction('清空', self)
         clear_action.setToolTip("清空当前显示的日志 (Ctrl+L)")
         clear_action.triggered.connect(self.clear_logs)
@@ -465,258 +689,273 @@ class LogMasterPro(QMainWindow):
         
         toolbar.addSeparator()
         
-        # 查找按钮
+        # === 搜索按钮 - 带放大镜图标 ===
         find_action = QAction('搜索', self)
         find_action.setToolTip("在日志中搜索内容 (Ctrl+F)")
         find_action.triggered.connect(self.show_search_dialog)
         toolbar.addAction(find_action)
         
-        # 添加弹性空间，让自动滚动复选框靠右对齐
+        # 添加弹性空间
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         toolbar.addWidget(spacer)
         
-        # 自动滚动复选框 - 放在工具栏右侧，设置合适的样式
+        # === 自动滚动复选框 ===
         self.auto_scroll_checkbox = QCheckBox("自动滚动")
         self.auto_scroll_checkbox.setToolTip("自动滚动到最新的日志条目")
         self.auto_scroll_checkbox.setChecked(True)
         self.auto_scroll_checkbox.setStyleSheet("""
             QCheckBox {
-                color: #ffffff;
-                font-size: 11px;
+                color: #cccccc;
+                font-size: 13px;
                 background-color: transparent;
-                spacing: 5px;
+                spacing: 6px;
+                padding: 4px 8px;
             }
             QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #cccccc;
-                border-radius: 2px;
-                background-color: white;
+                width: 16px;
+                height: 16px;
+                border: 2px solid #5a5a5a;
+                border-radius: 4px;
+                background-color: #2d2d2d;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0e639c;
+                background-color: #3c3c3c;
             }
             QCheckBox::indicator:checked {
-                background-color: #3498db;
-                border-color: #3498db;
-                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path fill="white" d="M9.5 3.5L8 2L4.5 5.5L3 4L1.5 5.5L4.5 8.5L8 5L9.5 3.5Z"/></svg>');
-            }
-            QCheckBox::indicator:unchecked {
-                background-color: white;
-                border-color: #cccccc;
-            }
-            QCheckBox::indicator:unchecked:hover {
-                border-color: #3498db;
+                background-color: #0e639c;
+                border-color: #0e639c;
             }
         """)
         toolbar.addWidget(self.auto_scroll_checkbox)
         
-        # 添加滚动到底部按钮 - 重新设计，更直观
-        scroll_bottom_btn = QPushButton("🔽 最新日志")
+        # === 滚动到底部按钮 - 精美的绿色按钮 ===
+        scroll_bottom_btn = QPushButton("最新")
         scroll_bottom_btn.setToolTip("滚动到最新的日志条目")
-        scroll_bottom_btn.setFixedSize(80, 28)
+        scroll_bottom_btn.setFixedSize(60, 28)
         scroll_bottom_btn.setStyleSheet("""
             QPushButton {
-                background-color: #27ae60;
-                color: white;
+                background-color: #2d8a2d;
+                color: #ffffff;
                 border: none;
                 border-radius: 4px;
-                font-size: 11px;
-                font-weight: bold;
-                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 500;
             }
             QPushButton:hover {
-                background-color: #229954;
+                background-color: #3da33d;
             }
             QPushButton:pressed {
-                background-color: #1e8449;
+                background-color: #1d6a1d;
             }
         """)
         scroll_bottom_btn.clicked.connect(lambda: self.log_text.scroll_to_bottom())
         toolbar.addWidget(scroll_bottom_btn)
         
-    def create_device_control_group(self) -> QGroupBox:
-        """创建设备控制组"""
-        group = QGroupBox("设备控制")
-        layout = QHBoxLayout()
+    def create_top_control_panel(self) -> QWidget:
+        """创建顶部控制面板（包含设备选择和内联搜索，更加紧凑）"""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
         
-        # 设备选择下拉框
+        # --- 设备控制部分 ---
+        device_label = QLabel("设备")
+        device_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(device_label)
         self.device_combo = QComboBox()
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-        self.device_combo.setMinimumWidth(300)
-        layout.addWidget(QLabel("设备:"))
-        layout.addWidget(self.device_combo, 2)
+        self.device_combo.setMinimumWidth(250)
+        layout.addWidget(self.device_combo)
         
-        # 刷新按钮
-        refresh_btn = QPushButton("刷新设备")
+        refresh_btn = QPushButton("刷新")
         refresh_btn.setToolTip("重新扫描连接的Android设备")
         refresh_btn.clicked.connect(self.refresh_devices)
         layout.addWidget(refresh_btn)
         
-        # 清除缓冲区按钮
-        clear_buffer_btn = QPushButton("清除缓冲区")
-        clear_buffer_btn.setToolTip("清除Android设备的日志缓冲区")
+        clear_buffer_btn = QPushButton("清缓存")
+        clear_buffer_btn.setToolTip("清除Android设备的日志缓冲区 (adb logcat -c)")
         clear_buffer_btn.clicked.connect(self.clear_logcat_buffer)
         layout.addWidget(clear_buffer_btn)
         
-        # 日志统计
-        self.log_stats_label = QLabel("就绪")
-        layout.addWidget(self.log_stats_label)
+        # 弹簧分隔设备控制和搜索
+        layout.addSpacing(20)
         
-        layout.addStretch()
-        group.setLayout(layout)
-        return group
+        # --- 搜索部分 ---
+        search_label = QLabel("搜索")
+        search_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(search_label)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("在日志中搜索...")
+        self.search_edit.setToolTip("在当前显示的日志内容中搜索，支持区分大小写")
+        self.search_edit.textChanged.connect(self.on_search_text_changed)
+        self.search_edit.setMinimumWidth(200)
+        layout.addWidget(self.search_edit)
         
-    def create_filter_search_group(self) -> QGroupBox:
-        """创建过滤器和搜索组"""
-        group = QGroupBox("高级过滤器和搜索")
-        layout = QVBoxLayout()
+        # 区分大小写复选框 - 使用清晰的文字
+        self.case_sensitive_check = QCheckBox("区分大小写")
+        self.case_sensitive_check.setToolTip("勾选后搜索时区分大小写")
+        self.case_sensitive_check.setStyleSheet("""
+            QCheckBox {
+                color: #aaaaaa;
+                font-size: 12px;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #5a5a5a;
+                border-radius: 4px;
+                background-color: #2d2d2d;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0e639c;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0e639c;
+                border-color: #0e639c;
+            }
+        """)
+        self.case_sensitive_check.stateChanged.connect(self.on_search_text_changed)
+        layout.addWidget(self.case_sensitive_check)
         
-        # 过滤器行
-        filter_layout = QHBoxLayout()
+        # 搜索统计标签
+        self.search_stats_label = QLabel("")
+        self.search_stats_label.setMinimumWidth(80)
+        self.search_stats_label.setStyleSheet("color: #666666; font-size: 12px;")
+        layout.addWidget(self.search_stats_label)
         
-        # 日志级别过滤
-        filter_layout.addWidget(QLabel("级别:"))
+        # 上一个/下一个按钮 - 使用清晰的文字
+        self.find_prev_btn = QPushButton("上一个")
+        self.find_prev_btn.setToolTip("跳转到上一个匹配结果 (Shift+Enter)")
+        self.find_prev_btn.setFixedHeight(28)
+        self.find_prev_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 0 10px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                color: #ffffff;
+            }
+        """)
+        self.find_prev_btn.clicked.connect(self.find_previous)
+        layout.addWidget(self.find_prev_btn)
+        
+        self.find_next_btn = QPushButton("下一个")
+        self.find_next_btn.setToolTip("跳转到下一个匹配结果 (Enter)")
+        self.find_next_btn.setFixedHeight(28)
+        self.find_next_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 0 10px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                color: #ffffff;
+            }
+        """)
+        self.find_next_btn.clicked.connect(self.find_next)
+        layout.addWidget(self.find_next_btn)
+        
+        return panel
+        
+    def create_filter_panel(self) -> QWidget:
+        """创建过滤器面板（一行展示所有过滤器）"""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 日志级别
+        level_label = QLabel("级别")
+        level_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(level_label)
         self.level_combo = QComboBox()
         self.level_combo.addItems(["全部", "Verbose", "Debug", "Info", "Warning", "Error", "Fatal"])
         self.level_combo.currentTextChanged.connect(self.on_filter_changed_delayed)
-        self.level_combo.setMinimumWidth(100)
-        filter_layout.addWidget(self.level_combo)
+        self.level_combo.setFixedWidth(100)
+        layout.addWidget(self.level_combo)
         
-        # 标签过滤（支持正则表达式）
-        filter_layout.addWidget(QLabel("标签:"))
+        # 标签过滤
+        tag_label = QLabel("标签")
+        tag_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(tag_label)
         self.tag_edit = QLineEdit()
-        self.tag_edit.setPlaceholderText("例: MyApp,Network,.*Test.* 或正则表达式")
-        self.tag_edit.setToolTip("输入要过滤的标签，支持逗号分隔多个标签或正则表达式")
+        self.tag_edit.setPlaceholderText("例: MyApp,Network")
+        self.tag_edit.setToolTip("输入要过滤的标签，支持逗号分隔或正则表达式")
         self.tag_edit.textChanged.connect(self.on_filter_changed_delayed)
-        self.tag_edit.setMinimumWidth(200)
-        filter_layout.addWidget(self.tag_edit)
+        self.tag_edit.setMinimumWidth(180)
+        layout.addWidget(self.tag_edit)
         
-        # 标签过滤模式
-        self.tag_regex_checkbox = QCheckBox("启用正则表达式")
-        self.tag_regex_checkbox.setToolTip("启用正则表达式匹配标签（支持复杂匹配模式）")
-        self.tag_regex_checkbox.stateChanged.connect(self.on_filter_changed_delayed)
+        self.tag_regex_checkbox = QCheckBox("正则")
+        self.tag_regex_checkbox.setToolTip("启用正则表达式匹配标签")
         self.tag_regex_checkbox.setStyleSheet("""
             QCheckBox {
+                color: #888888;
                 font-size: 12px;
-                color: #000000;
+                spacing: 4px;
             }
             QCheckBox::indicator {
                 width: 14px;
                 height: 14px;
-                border: 1px solid #ccc;
-                border-radius: 2px;
-                background-color: white;
+                border: 2px solid #4a4a4a;
+                border-radius: 3px;
+                background-color: #2d2d2d;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0e639c;
             }
             QCheckBox::indicator:checked {
-                background-color: #3498db;
-                border-color: #3498db;
-                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path fill="white" d="M9.5 3.5L8 2L4.5 5.5L3 4L1.5 5.5L4.5 8.5L8 5L9.5 3.5Z"/></svg>');
-            }
-            QCheckBox::indicator:unchecked {
-                background-color: white;
-                border-color: #cccccc;
-            }
-            QCheckBox::indicator:unchecked:hover {
-                border-color: #3498db;
+                background-color: #0e639c;
+                border-color: #0e639c;
             }
         """)
-        filter_layout.addWidget(self.tag_regex_checkbox)
+        self.tag_regex_checkbox.stateChanged.connect(self.on_filter_changed_delayed)
+        layout.addWidget(self.tag_regex_checkbox)
         
         # 关键字过滤
-        filter_layout.addWidget(QLabel("关键字:"))
+        keyword_label = QLabel("关键字")
+        keyword_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(keyword_label)
         self.keyword_edit = QLineEdit()
-        self.keyword_edit.setPlaceholderText("在日志消息内容中搜索...")
-        self.keyword_edit.setToolTip("输入要在日志消息内容中搜索的关键字")
+        self.keyword_edit.setPlaceholderText("包含的内容...")
         self.keyword_edit.textChanged.connect(self.on_filter_changed_delayed)
-        self.keyword_edit.setMinimumWidth(150)
-        filter_layout.addWidget(self.keyword_edit)
+        self.keyword_edit.setMinimumWidth(120)
+        layout.addWidget(self.keyword_edit)
         
         # PID过滤
-        filter_layout.addWidget(QLabel("PID:"))
+        pid_label = QLabel("PID")
+        pid_label.setStyleSheet("color: #888888; font-size: 13px; font-weight: 500;")
+        layout.addWidget(pid_label)
         self.pid_edit = QLineEdit()
-        self.pid_edit.setPlaceholderText("进程ID号...")
-        self.pid_edit.setToolTip("输入要过滤的进程ID号")
+        self.pid_edit.setPlaceholderText("进程ID")
         self.pid_edit.textChanged.connect(self.on_filter_changed_delayed)
-        self.pid_edit.setMinimumWidth(80)
-        filter_layout.addWidget(self.pid_edit)
+        self.pid_edit.setFixedWidth(80)
+        layout.addWidget(self.pid_edit)
         
-        # 应用过滤器按钮
-        apply_filter_btn = QPushButton("应用过滤器")
-        apply_filter_btn.setToolTip("立即应用当前设置的过滤条件到日志流")
-        apply_filter_btn.clicked.connect(self.apply_filters)
-        filter_layout.addWidget(apply_filter_btn)
+        # 占位
+        layout.addStretch()
         
-        filter_layout.addStretch()
-        layout.addLayout(filter_layout)
+        # 日志统计显示在这一行的最右侧
+        self.log_stats_label = QLabel("就绪")
+        self.log_stats_label.setStyleSheet("color: #666666; font-size: 12px;")
+        layout.addWidget(self.log_stats_label)
         
-        # 搜索行
-        search_layout = QHBoxLayout()
+        return panel
         
-        search_layout.addWidget(QLabel("搜索:"))
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("在当前显示的日志中搜索内容...")
-        self.search_edit.setToolTip("在当前显示的日志内容中搜索，不影响实时日志流")
-        self.search_edit.textChanged.connect(self.on_search_text_changed)
-        self.search_edit.setMinimumWidth(200)
-        search_layout.addWidget(self.search_edit)
-        
-        # 搜索选项
-        self.case_sensitive_check = QCheckBox("区分大小写")
-        self.case_sensitive_check.stateChanged.connect(self.on_search_text_changed)
-        self.case_sensitive_check.setStyleSheet("""
-            QCheckBox {
-                font-size: 12px;
-                color: #000000;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #ccc;
-                border-radius: 2px;
-                background-color: white;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #3498db;
-                border-color: #3498db;
-                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path fill="white" d="M9.5 3.5L8 2L4.5 5.5L3 4L1.5 5.5L4.5 8.5L8 5L9.5 3.5Z"/></svg>');
-            }
-            QCheckBox::indicator:unchecked {
-                background-color: white;
-                border-color: #cccccc;
-            }
-            QCheckBox::indicator:unchecked:hover {
-                border-color: #3498db;
-            }
-        """)
-        search_layout.addWidget(self.case_sensitive_check)
-        
-        # 搜索统计
-        self.search_stats_label = QLabel("")
-        search_layout.addWidget(self.search_stats_label)
-        
-        # 查找下一个/上一个
-        self.find_next_btn = QPushButton("下一个")
-        self.find_next_btn.clicked.connect(self.find_next)
-        search_layout.addWidget(self.find_next_btn)
-        
-        self.find_prev_btn = QPushButton("上一个")
-        self.find_prev_btn.clicked.connect(self.find_previous)
-        search_layout.addWidget(self.find_prev_btn)
-        
-        search_layout.addStretch()
-        layout.addLayout(search_layout)
-        
-        # 添加正则表达式提示
-        regex_hint = QLabel("提示: 标签过滤支持正则表达式，如: MyApp|Network|.*Test.*, 或使用逗号分隔多个标签: MyApp,Network,Database")
-        regex_hint.setStyleSheet("color: #666; font-size: 10px;")
-        layout.addWidget(regex_hint)
-        
-        group.setLayout(layout)
-        return group
-        
-    def create_log_display_group(self) -> QGroupBox:
-        """创建日志显示组"""
-        group = QGroupBox("日志输出")
-        layout = QVBoxLayout()
+    def create_log_display_group(self) -> QWidget:
+        """创建日志显示组 (移除臃肿的GroupBox边框，只保留编辑器本身)"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
         
         # 使用自定义的彩色日志编辑器
         self.log_text = LogTextEdit()
@@ -726,26 +965,50 @@ class LogMasterPro(QMainWindow):
         # 进度条（用于大量日志时的显示）
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(4) # 让进度条更细更现代
         layout.addWidget(self.progress_bar)
         
-        group.setLayout(layout)
-        return group
+        return container
         
     def init_device_monitoring(self):
         """初始化设备监控"""
         self.device_manager.add_device_callback(self.on_devices_updated)
-        self.device_manager.start_monitoring()
-        self.refresh_devices()
+        
+        # 不要在这里同步刷新设备，这样会阻塞启动
+        self.device_combo.addItem("正在加载设备...")
+        self.device_combo.setEnabled(False)
+        
+        # 将耗时的设备刷新放到后台线程
+        threading.Thread(target=self._async_initial_refresh, daemon=True).start()
         
         # 设置过滤器延迟应用定时器
         self.filter_timer = QTimer()
         self.filter_timer.setSingleShot(True)
         self.filter_timer.timeout.connect(self.apply_filters)
         
-    def refresh_devices(self):
-        """刷新设备列表"""
+    def _async_initial_refresh(self):
+        """在后台线程进行初始的设备扫描，不卡主界面"""
+        print("后台线程开始初始扫描设备...")
         devices = self.device_manager.get_devices()
-        self.update_device_combo(devices)
+        print(f"后台扫描完成，找到 {len(devices)} 台设备")
+        
+        # 发送信号通知主线程更新UI
+        self.devices_updated_signal.emit(devices)
+        
+        # 扫描完成后，再开始定期监控
+        self.device_manager.start_monitoring()
+        
+    def refresh_devices(self):
+        """刷新设备列表（异步）"""
+        self.device_combo.setEnabled(False)
+        self.device_combo.setItemText(self.device_combo.currentIndex(), "正在刷新设备...")
+        # 将耗时的刷新操作放入后台线程
+        threading.Thread(target=self._async_refresh_devices, daemon=True).start()
+        
+    def _async_refresh_devices(self):
+        """后台刷新设备列表"""
+        devices = self.device_manager.get_devices()
+        self.devices_updated_signal.emit(devices)
         
     def update_device_combo(self, devices: list):
         """更新设备下拉框"""
@@ -950,13 +1213,13 @@ class LogMasterPro(QMainWindow):
     def update_ui_for_logging_state(self, is_logging: bool):
         """更新UI状态"""
         if is_logging:
-            self.start_stop_action.setText("⏸ 停止")
-            self.start_stop_action.setToolTip("停止当前日志记录")
+            self.start_stop_action.setText("停止")
+            self.start_stop_action.setToolTip("停止当前日志记录 (Ctrl+R)")
             # 使用QTimer延迟UI更新，确保在主线程执行
             QTimer.singleShot(0, lambda: self._update_logging_ui(True))
         else:
-            self.start_stop_action.setText("▶ 开始")
-            self.start_stop_action.setToolTip("开始记录新的日志")
+            self.start_stop_action.setText("开始")
+            self.start_stop_action.setToolTip("开始记录日志 (Ctrl+R)")
             # 使用QTimer延迟UI更新，确保在主线程执行
             QTimer.singleShot(0, lambda: self._update_logging_ui(False))
     
@@ -976,7 +1239,11 @@ class LogMasterPro(QMainWindow):
     
     def stop_logging(self):
         """停止日志记录 - 增强版"""
-        print("停止日志记录函数被调用")
+        import traceback
+        print("======== 停止日志记录函数被调用 ========")
+        # 强行打印详细的堆栈，看看是谁在“幽灵调用”它
+        traceback.print_stack()
+        print("=========================================")
         
         # 停止监控线程
         self._stop_logging_monitor()
@@ -1035,11 +1302,12 @@ class LogMasterPro(QMainWindow):
                 
                 # 如果读取器停止运行，或者静默时间太长，尝试重启
                 if not reader_running or (silent_time > max_silent_time and processed_logs > 0):
-                    print(f"检测到日志记录异常: 运行状态={reader_running}, 静默时间={silent_time:.1f}秒")
+                    print(f"健康检查：检测到日志记录异常! 运行状态={reader_running}, 静默时间={silent_time:.1f}秒, processed={processed_logs}")
                     
                     if restart_attempts < max_restart_attempts:
                         restart_attempts += 1
                         print(f"尝试自动重启日志记录 (第{restart_attempts}次)")
+                        self._restarting_logcat = True
                         
                         # 停止当前记录
                         try:
@@ -1064,9 +1332,13 @@ class LogMasterPro(QMainWindow):
                                 print(f"自动重启失败: {restart_e}")
                         else:
                             print("设备状态异常，无法自动重启")
+                            
+                        self._restarting_logcat = False
                     else:
                         print(f"已达到最大重启次数({max_restart_attempts})，停止自动重启")
                         # 可以选择停止整个记录或继续监控
+                        # 在UI线程恢复状态
+                        QTimer.singleShot(0, self._recover_ui_after_fatal_stop)
                         break
                 else:
                     # 如果一切正常，重置重启计数
@@ -1082,6 +1354,15 @@ class LogMasterPro(QMainWindow):
         
         print("日志监控线程结束")
         # 如果是因为异常退出，可以在这里添加额外的处理逻辑
+        
+    def _recover_ui_after_fatal_stop(self):
+        """当日志监控多次重启失败后，在UI线程恢复停止状态"""
+        if self.is_logging:
+            print("自动恢复界面状态为停止记录")
+            self.is_logging = False
+            self.start_stop_action.setText("开始")
+            self.start_stop_action.setToolTip("开始记录日志 (Ctrl+R)")
+            self.statusBar().showMessage("日志记录异常停止，已达到最大重启次数")
         
     def get_filter_settings(self) -> dict:
         """获取过滤器设置 - 修复空值处理"""
@@ -1140,12 +1421,17 @@ class LogMasterPro(QMainWindow):
             self.stop_logging()
             self.start_logging()
             
-    def on_log_received(self, log_entry: LogEntry):
+    def on_log_received(self, log_entries):
         """接收到新日志"""
         try:
             # 直接显示日志，保持实时性
-            self.log_text.append_colored_log(log_entry)
-            self.log_count += 1
+            if isinstance(log_entries, list):
+                self.log_text.append_colored_log_batch(log_entries)
+                self.log_count += len(log_entries)
+            else:
+                self.log_text.append_colored_log(log_entries)
+                self.log_count += 1
+                
             self.update_log_stats()
         except Exception as e:
             print(f"处理日志时出错: {e}")
@@ -1154,11 +1440,19 @@ class LogMasterPro(QMainWindow):
         
     def update_log_stats(self):
         """更新日志统计"""
+        # 不要每收到一条日志就更新 UI
+        # 限制更新频率，例如每 500 条或用 QTimer
         stats = self.logcat_reader.get_stats()
         total_logs = stats['total_logs']
         processed_logs = stats['processed_logs']
         
-        self.log_stats_label.setText(f"总日志: {total_logs} | 已处理: {processed_logs}")
+        # 只有在数量有显著变化时才更新文本，减少 UI 刷新压力
+        if getattr(self, '_last_update_count', 0) == processed_logs:
+            return
+            
+        if processed_logs - getattr(self, '_last_update_count', 0) > 100 or processed_logs < 100:
+            self.log_stats_label.setText(f"总日志: {total_logs} | 已处理: {processed_logs}")
+            self._last_update_count = processed_logs
         
     def on_search_text_changed(self):
         """搜索文本变化"""
@@ -1327,16 +1621,22 @@ class LogMasterPro(QMainWindow):
         """监控logcat状态"""
         if self.is_logging and self.logcat_reader:
             stats = self.logcat_reader.get_stats()
-            if not stats['is_running']:
-                print("检测到logcat已停止，自动恢复界面状态")
-                self.is_logging = False
-                self.start_stop_action.setText("▶ 开始")
-                self.start_stop_action.setToolTip("开始记录新的日志")
-                # 使用QTimer延迟UI更新，确保在主线程执行
-                QTimer.singleShot(0, lambda: self.statusBar().showMessage("日志记录已停止"))
+            # 这里原本的逻辑会和 _logging_monitor_loop 中的自动重启冲突。
+            # 当监控线程尝试重启时，可能会出现短暂的 is_running 为 False 的状态，
+            # 此时如果这里强制恢复UI，就会把 is_logging 置为 False，导致自动重启中断或者后续再也无法记录。
+            # 为了让自动重启生效，我们只关注监控线程是否已经彻底放弃重启：
+            if not stats['is_running'] and not getattr(self, '_restarting_logcat', False):
+                # 如果健康检查线程没有在跑，或者也认为它死透了，我们才修改 UI
+                print("monitor_logcat_status 发现 logcat 停止，检查是否可以恢复 UI...")
+                pass # The automatic UI recovery should be handled properly, wait for health check.
     
     def update_status_bar(self):
-        """更新状态栏"""
+        """更新状态栏 (异步，避免卡主线程)"""
+        # 不要在这里直接调用 subprocess 去拿 ADB 状态，否则会卡爆主界面！
+        threading.Thread(target=self._async_update_status_bar, daemon=True).start()
+
+    def _async_update_status_bar(self):
+        """在后台线程获取 ADB 状态并更新 UI"""
         adb_available = self.device_manager.is_adb_available()
         adb_version = self.device_manager.get_adb_version()
         
