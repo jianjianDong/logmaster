@@ -73,8 +73,33 @@ class DeviceManager:
     def get_devices(self, notify=True) -> List[Device]:
         """获取当前连接的设备列表"""
         try:
+            # First try adb devices
             result = subprocess.run(['adb', 'devices', '-l'], 
                                   capture_output=True, text=True, timeout=5)
+            
+            # If adb is not found or fails, try looking for it in common locations
+            if result.returncode != 0:
+                adb_path = ''
+                if os.environ.get('ANDROID_HOME'):
+                    adb_path = os.path.join(os.environ.get('ANDROID_HOME'), 'platform-tools', 'adb')
+                elif os.environ.get('ANDROID_SDK_ROOT'):
+                    adb_path = os.path.join(os.environ.get('ANDROID_SDK_ROOT'), 'platform-tools', 'adb')
+                else:
+                    home = os.path.expanduser('~')
+                    common_paths = [
+                        os.path.join(home, 'Library/Android/sdk/platform-tools/adb'),
+                        '/usr/local/bin/adb',
+                        '/opt/homebrew/bin/adb'
+                    ]
+                    for p in common_paths:
+                        if os.path.exists(p):
+                            adb_path = p
+                            break
+                            
+                if adb_path and os.path.exists(adb_path):
+                    result = subprocess.run([adb_path, 'devices', '-l'], 
+                                          capture_output=True, text=True, timeout=5)
+
             if result.returncode == 0:
                 self._parse_devices_output(result.stdout)
             else:
