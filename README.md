@@ -5,6 +5,15 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](https://github.com/yourusername/LogMasterPro)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+## 📥 下载安装
+
+### macOS 独立版安装包
+无需配置任何 Python 环境或依赖，下载双击即可使用。
+
+👉 **[下载 LogMaster Pro 最新版 (macOS DMG)](https://github.com/jianjianDong/logmaster/releases/latest/download/LogMasterPro.dmg)** 👈
+
+---
+
 ## 🌟 项目介绍
 
 **LogMaster Pro** 是一款专业级的Android日志分析工具，专为开发者和测试工程师打造。它提供了比Android Studio Logcat更强大的功能，包括智能过滤、正则表达式支持、彩色日志显示和一键保存等特性。
