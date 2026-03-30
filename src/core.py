@@ -70,7 +70,7 @@ class DeviceManager:
             except Exception as e:
                 print(f"回调函数执行错误: {e}")
     
-    def get_devices(self) -> List[Device]:
+    def get_devices(self, notify=True) -> List[Device]:
         """获取当前连接的设备列表"""
         try:
             result = subprocess.run(['adb', 'devices', '-l'], 
@@ -90,7 +90,8 @@ class DeviceManager:
             print(f"获取设备列表时出错: {e}")
             self.devices = []
             
-        self._notify_callbacks()
+        if notify:
+            self._notify_callbacks()
         return self.devices
     
     def _parse_devices_output(self, output: str):
@@ -147,16 +148,17 @@ class DeviceManager:
     
     def _monitor_devices(self, interval: float):
         """监控设备连接状态的线程函数"""
-        previous_devices = self.get_devices().copy()
+        previous_devices = self.get_devices(notify=False).copy()
         
         while self._running:
             time.sleep(interval)
-            current_devices = self.get_devices()
+            current_devices = self.get_devices(notify=False)
             
             # 检查设备变化
             if self._devices_changed(previous_devices, current_devices):
                 self._handle_device_change(previous_devices, current_devices)
                 previous_devices = current_devices.copy()
+                self._notify_callbacks()
     
     def _devices_changed(self, old_devices: List[Device], 
                         new_devices: List[Device]) -> bool:

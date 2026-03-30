@@ -44,6 +44,10 @@ try:
     sys.exit(exit_code)
     
 except ImportError as e:
+    import traceback
+    with open('/tmp/logmaster_crash.log', 'w', encoding='utf-8') as f:
+        f.write(f"ImportError: {e}\n")
+        traceback.print_exc(file=f)
     print(f"❌ 导入模块失败: {e}")
     print("请确保已安装PyQt5: pip install PyQt5")
     sys.exit(1)
@@ -53,7 +57,10 @@ except KeyboardInterrupt:
     sys.exit(0)
     
 except Exception as e:
-    print(f"❌ 程序运行出错: {e}")
     import traceback
+    with open('/tmp/logmaster_crash.log', 'w', encoding='utf-8') as f:
+        f.write(f"Exception: {e}\n")
+        traceback.print_exc(file=f)
+    print(f"❌ 程序运行出错: {e}")
     traceback.print_exc()
     sys.exit(1)
