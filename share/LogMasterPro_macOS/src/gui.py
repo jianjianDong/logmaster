@@ -88,48 +88,67 @@ class LogTextEdit(QPlainTextEdit):
         
     def append_colored_log(self, log_entry: LogEntry):
         """添加带颜色的日志条目"""
-        # 格式化日志行
-        log_line = f"{log_entry.timestamp} {log_entry.pid}/{log_entry.tid} {log_entry.level.value} {log_entry.tag}: {log_entry.message}"
-        
-        # 获取日志级别的颜色
-        color = self.level_colors.get(log_entry.level.value, QColor(0, 0, 0))
-        
-        # 创建文本格式
-        format = QTextCharFormat()
-        format.setForeground(color)
-        
-        # 如果行数过多，删除最早的行
-        if self.blockCount() >= self.max_lines:
-            # 删除前1000行
-            start_cursor = QTextCursor(self.document())
-            start_cursor.movePosition(QTextCursor.Start)
-            start_cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, 1000)
-            start_cursor.select(QTextCursor.Document)
-            start_cursor.removeSelectedText()
-        
-        # 保存当前焦点控件
-        focus_widget = QApplication.focusWidget()
-        was_focused = (focus_widget is not None)
-        
-        # 移动到文档末尾并插入文本
-        cursor = QTextCursor(self.document())
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertText(log_line + "\n", format)
-        
-        # 简化的自动滚动逻辑：只要复选框选中就滚动到底部
-        if self.auto_scroll_checkbox and self.auto_scroll_checkbox.isChecked():
-            # 使用延迟滚动，避免频繁操作影响性能
-            if not self._pending_scroll:
-                self._pending_scroll = True
-                self._scroll_timer.start(10)  # 10ms延迟，确保UI更新完成
+        try:
+            # 格式化日志行
+            log_line = f"{log_entry.timestamp} {log_entry.pid}/{log_entry.tid} {log_entry.level.value} {log_entry.tag}: {log_entry.message}"
+            
+            # 获取日志级别的颜色
+            color = self.level_colors.get(log_entry.level.value, QColor(0, 0, 0))
+            
+            # 创建文本格式
+            format = QTextCharFormat()
+            format.setForeground(color)
+            
+            # 检查文档是否有效
+            doc = self.document()
+            if not doc:
+                print("文档无效，跳过日志添加")
+                return
+            
+            # 如果行数过多，删除最早的行
+            if self.blockCount() >= self.max_lines:
+                # 删除前1000行（确保不超过实际行数）
+                lines_to_delete = min(1000, self.blockCount())
+                start_cursor = QTextCursor(doc)
+                start_cursor.movePosition(QTextCursor.Start)
+                if lines_to_delete > 0:
+                    start_cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, lines_to_delete)
+                start_cursor.select(QTextCursor.Document)
+                start_cursor.removeSelectedText()
+            
+            # 保存当前焦点控件
+            focus_widget = QApplication.focusWidget()
+            was_focused = (focus_widget is not None)
+            
+            # 移动到文档末尾并插入文本
+            cursor = QTextCursor(doc)
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText(log_line + "\n", format)
+            
+            # 简化的自动滚动逻辑：只要复选框选中就滚动到底部
+            if self.auto_scroll_checkbox and self.auto_scroll_checkbox.isChecked():
+                # 使用延迟滚动，避免频繁操作影响性能
+                if not self._pending_scroll:
+                    self._pending_scroll = True
+                    self._scroll_timer.start(10)  # 10ms延迟，确保UI更新完成
+                    
+        except Exception as e:
+            print(f"添加日志失败: {e}")
+            import traceback
+            traceback.print_exc()
                 
     def _perform_delayed_scroll(self):
         """执行延迟滚动"""
         self._pending_scroll = False
-        scrollbar = self.verticalScrollBar()
-        if scrollbar:
-            # 直接设置到最大值，确保看到最新日志
-            scrollbar.setValue(scrollbar.maximum())
+        try:
+            scrollbar = self.verticalScrollBar()
+            if scrollbar:
+                # 直接设置到最大值，确保看到最新日志
+                max_value = scrollbar.maximum()
+                if max_value >= 0:
+                    scrollbar.setValue(max_value)
+        except Exception as e:
+            print(f"滚动失败: {e}")
                 
     def scroll_to_bottom(self):
         """强制滚动到底部 - 用于手动触发"""
@@ -139,6 +158,9 @@ class LogTextEdit(QPlainTextEdit):
 
 
 class LogMasterPro(QMainWindow):
+    # 定义信号 - 用于线程安全的UI更新
+    devices_updated_signal = pyqtSignal(list)
+    
     def __init__(self):
         super().__init__()
         try:
@@ -150,6 +172,9 @@ class LogMasterPro(QMainWindow):
             self.log_count = 0
             self.log_update_thread = None
             self.search_text = ""
+            
+            # 连接信号到槽函数
+            self.devices_updated_signal.connect(self._on_devices_updated_safe)
             
             # 设置应用程序终止处理
             self.setup_termination_handling()
@@ -211,11 +236,11 @@ class LogMasterPro(QMainWindow):
                 margin-top: 10px;
                 font-size: 14px;
                 font-weight: bold;
-                color: #333;
+                color: #000000;
             }
             QPushButton {
                 background-color: #f8f9fa;
-                color: #333;
+                color: #000000;
                 border: 1px solid #ddd;
                 border-radius: 4px;
                 padding: 6px 12px;
@@ -225,11 +250,14 @@ class LogMasterPro(QMainWindow):
                 background-color: #e9ecef;
             }
             QLineEdit, QComboBox {
-                border: 1px solid #ccc;
+                border: 1px solid #666;
                 border-radius: 4px;
                 padding: 6px;
                 font-size: 12px;
-                background-color: white;
+                background-color: #ffffff;
+                color: #000000;
+                selection-background-color: #3498db;
+                selection-color: #ffffff;
             }
             QLineEdit:focus, QComboBox:focus {
                 border-color: #3498db;
@@ -244,15 +272,15 @@ class LogMasterPro(QMainWindow):
                 height: 12px;
             }
             QComboBox QAbstractItemView {
-                border: 1px solid #ccc;
+                border: 1px solid #666;
                 selection-background-color: #3498db;
-                selection-color: white;
-                background-color: white;
-                color: #333;
+                selection-color: #ffffff;
+                background-color: #ffffff;
+                color: #000000;
                 padding: 4px;
             }
             QComboBox QAbstractItemView::item {
-                color: #333;
+                color: #000000;
                 padding: 6px;
                 min-height: 20px;
             }
@@ -266,7 +294,7 @@ class LogMasterPro(QMainWindow):
             }
             QCheckBox {
                 font-size: 12px;
-                color: #333;
+                color: #000000;
             }
             QCheckBox::indicator {
                 width: 14px;
@@ -282,18 +310,21 @@ class LogMasterPro(QMainWindow):
             }
             QStatusBar {
                 background-color: #34495e;
-                color: white;
+                color: #ffffff;
                 font-size: 12px;
             }
             QTextEdit, QPlainTextEdit {
-                border: 1px solid #ccc;
+                border: 1px solid #666;
                 border-radius: 4px;
-                background-color: white;
+                background-color: #ffffff;
+                color: #000000;
                 font-family: 'Monaco', 'Menlo', 'Consolas', 'Courier New', monospace;
                 font-size: 12px;
+                selection-background-color: #3498db;
+                selection-color: #ffffff;
             }
             QLabel {
-                color: #333;
+                color: #000000;
                 font-size: 12px;
             }
         """)
@@ -444,7 +475,7 @@ class LogMasterPro(QMainWindow):
         self.auto_scroll_checkbox.setChecked(True)
         self.auto_scroll_checkbox.setStyleSheet("""
             QCheckBox {
-                color: #cccccc;
+                color: #ffffff;
                 font-size: 11px;
                 background-color: transparent;
                 spacing: 5px;
@@ -559,7 +590,7 @@ class LogMasterPro(QMainWindow):
         self.tag_regex_checkbox.setStyleSheet("""
             QCheckBox {
                 font-size: 12px;
-                color: #333;
+                color: #000000;
             }
             QCheckBox::indicator {
                 width: 14px;
@@ -627,7 +658,7 @@ class LogMasterPro(QMainWindow):
         self.case_sensitive_check.setStyleSheet("""
             QCheckBox {
                 font-size: 12px;
-                color: #333;
+                color: #000000;
             }
             QCheckBox::indicator {
                 width: 14px;
@@ -731,6 +762,11 @@ class LogMasterPro(QMainWindow):
                     if isinstance(device, Device) and device.serial == current_device.serial:
                         self.device_combo.setCurrentIndex(i)
                         break
+            else:
+                # 如果没有之前选中的设备，自动选择第一个设备
+                self.device_combo.setCurrentIndex(0)
+                # 立即更新设备选择
+                self._update_device_selection()
                         
     def on_device_changed(self):
         """设备选择变化处理 - 增强防抖版"""
@@ -785,29 +821,55 @@ class LogMasterPro(QMainWindow):
     
     def _update_device_selection(self):
         """更新设备选择（不处理记录状态）"""
+        print(f"_update_device_selection 被调用")
         index = self.device_combo.currentIndex()
+        print(f"当前选中索引: {index}")
         if index >= 0:
             device = self.device_combo.itemData(index)
+            print(f"设备数据: {device}")
             if isinstance(device, Device):
                 self.current_device = device
-                self.statusBar().showMessage(f"已选择设备: {device.serial}")
-                # 更新窗口标题显示当前设备
-                if not self.is_logging:
-                    self.setWindowTitle(f'Logmaster - {device.serial}')
+                print(f"更新 current_device: {device.serial}")
+                # 使用QTimer延迟UI更新，确保在主线程执行
+                QTimer.singleShot(0, lambda: self._update_ui_for_device(device))
             else:
                 self.current_device = None
-                # 重置窗口标题
-                if not self.is_logging:
-                    self.setWindowTitle('Logmaster - Android日志分析工具')
+                print("current_device 设置为 None (数据类型错误)")
+                # 使用QTimer延迟UI更新，确保在主线程执行
+                QTimer.singleShot(0, lambda: self._clear_ui_device())
         else:
             self.current_device = None
-            # 重置窗口标题
-            if not self.is_logging:
-                self.setWindowTitle('Logmaster - Android日志分析工具')
+            print("current_device 设置为 None (索引<0)")
+            # 使用QTimer延迟UI更新，确保在主线程执行
+            QTimer.singleShot(0, lambda: self._clear_ui_device())
+    
+    def _update_ui_for_device(self, device):
+        """在主线程更新设备UI"""
+        self.statusBar().showMessage(f"已选择设备: {device.serial}")
+        # 更新窗口标题显示当前设备
+        if not self.is_logging:
+            self.setWindowTitle(f'Logmaster - {device.serial}')
+    
+    def _clear_ui_device(self):
+        """清除设备UI显示"""
+        self.statusBar().showMessage("就绪")
+        # 重置窗口标题
+        if not self.is_logging:
+            self.setWindowTitle('Logmaster - Android日志分析工具')
             
     def on_devices_updated(self, devices: list):
-        """设备列表更新处理"""
-        self.update_device_combo(devices)
+        """设备列表更新处理 - 线程安全版本"""
+        # 使用信号机制确保在主线程更新UI
+        self.devices_updated_signal.emit(devices)
+    
+    def _on_devices_updated_safe(self, devices: list):
+        """在主线程安全地更新设备列表"""
+        try:
+            self.update_device_combo(devices)
+        except Exception as e:
+            print(f"设备列表更新错误: {e}")
+            import traceback
+            traceback.print_exc()
         
     def toggle_logging(self):
         """切换日志记录状态"""
@@ -825,12 +887,14 @@ class LogMasterPro(QMainWindow):
             print("已经在记录中，跳过启动")
             return
             
+        print(f"current_device: {self.current_device}")
         if not self.current_device:
             QMessageBox.warning(self, "警告", "请先选择设备")
             return
             
+        print(f"当前设备状态: '{self.current_device.status}'")
         if self.current_device.status != "device":
-            QMessageBox.warning(self, "警告", "设备未连接或状态异常")
+            QMessageBox.warning(self, "警告", f"设备未连接或状态异常 (状态: {self.current_device.status})")
             return
         
         # 获取过滤器设置
@@ -878,6 +942,17 @@ class LogMasterPro(QMainWindow):
         if is_logging:
             self.start_stop_action.setText("⏸ 停止")
             self.start_stop_action.setToolTip("停止当前日志记录")
+            # 使用QTimer延迟UI更新，确保在主线程执行
+            QTimer.singleShot(0, lambda: self._update_logging_ui(True))
+        else:
+            self.start_stop_action.setText("▶ 开始")
+            self.start_stop_action.setToolTip("开始记录新的日志")
+            # 使用QTimer延迟UI更新，确保在主线程执行
+            QTimer.singleShot(0, lambda: self._update_logging_ui(False))
+    
+    def _update_logging_ui(self, is_logging: bool):
+        """在主线程更新日志记录UI"""
+        if is_logging:
             self.statusBar().showMessage("正在记录日志...")
             # 更新窗口标题显示记录状态
             if self.current_device:
@@ -885,8 +960,6 @@ class LogMasterPro(QMainWindow):
             else:
                 self.setWindowTitle('Logmaster - Android日志分析工具 [正在记录]')
         else:
-            self.start_stop_action.setText("▶ 开始")
-            self.start_stop_action.setToolTip("开始记录新的日志")
             self.statusBar().showMessage("日志记录已停止")
             # 恢复窗口标题
             self.setWindowTitle('Logmaster - Android日志分析工具')
@@ -910,7 +983,7 @@ class LogMasterPro(QMainWindow):
         print("日志记录已停止")
         
     def get_filter_settings(self) -> dict:
-        """获取过滤器设置"""
+        """获取过滤器设置 - 修复空值处理"""
         filters = {}
         
         # 日志级别
@@ -925,22 +998,31 @@ class LogMasterPro(QMainWindow):
                 "Fatal": "F"
             }
             filters['level'] = level_map.get(level_text)
+        else:
+            filters['level'] = None
         
         # 标签（支持正则表达式）
         tag_text = self.tag_edit.text().strip()
         if tag_text:
             filters['tag'] = tag_text
             filters['tag_regex'] = self.tag_regex_checkbox.isChecked()
+        else:
+            filters['tag'] = None
+            filters['tag_regex'] = False
             
         # 关键字
         keyword_text = self.keyword_edit.text().strip()
         if keyword_text:
             filters['keyword'] = keyword_text
+        else:
+            filters['keyword'] = None
             
         # PID
         pid_text = self.pid_edit.text().strip()
         if pid_text:
             filters['pid'] = pid_text
+        else:
+            filters['pid'] = None
             
         return filters
         
@@ -1115,7 +1197,8 @@ class LogMasterPro(QMainWindow):
         """清除logcat缓冲区"""
         if self.current_device:
             self.logcat_reader._clear_logcat_buffer(self.current_device.serial)
-            self.statusBar().showMessage("已清除logcat缓冲区")
+            # 使用QTimer延迟UI更新，确保在主线程执行
+            QTimer.singleShot(0, lambda: self.statusBar().showMessage("已清除logcat缓冲区"))
         else:
             QMessageBox.warning(self, "警告", "请先选择设备")
             
@@ -1148,7 +1231,8 @@ class LogMasterPro(QMainWindow):
                 self.is_logging = False
                 self.start_stop_action.setText("▶ 开始")
                 self.start_stop_action.setToolTip("开始记录新的日志")
-                self.statusBar().showMessage("日志记录已停止")
+                # 使用QTimer延迟UI更新，确保在主线程执行
+                QTimer.singleShot(0, lambda: self.statusBar().showMessage("日志记录已停止"))
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -1168,7 +1252,8 @@ class LogMasterPro(QMainWindow):
         if self.is_logging:
             status_text += " | 正在记录日志..."
             
-        self.statusBar().showMessage(status_text)
+        # 使用QTimer延迟UI更新，确保在主线程执行
+        QTimer.singleShot(0, lambda: self.statusBar().showMessage(status_text))
     
     def setup_termination_handling(self):
         """设置应用程序终止处理"""

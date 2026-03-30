@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# LogMaster 启动脚本
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$DIR"
+
+# 设置Python路径
+export PYTHONPATH="$DIR/../Resources:$PYTHONPATH"
+
+# 设置环境变量，确保ADB能被找到
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+# 启动应用（ADB检测将在应用内部处理）
+python3 "$DIR/../Resources/LogMasterPro.py" "$@"

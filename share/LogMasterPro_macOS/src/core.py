@@ -281,16 +281,17 @@ class LogcatReader:
     
     def start_logcat(self, device_serial: str, clear_buffer: bool = True,
                     filters: Optional[dict] = None):
-        """开始读取logcat"""
+        """开始读取logcat - 修复过滤器更新逻辑"""
         if self._running:
             self.stop_logcat()
         
         if clear_buffer:
             self._clear_logcat_buffer(device_serial)
         
-        # 应用过滤器
+        # 应用过滤器 - 正确处理None值
         if filters:
-            self._filters.update(filters)
+            for key, value in filters.items():
+                self._filters[key] = value
         
         # 构建adb logcat命令 - 简化命令，避免复杂参数
         cmd = ['adb', '-s', device_serial, 'logcat', '-v', 'threadtime']

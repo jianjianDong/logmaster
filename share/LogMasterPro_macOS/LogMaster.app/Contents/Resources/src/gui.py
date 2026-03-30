@@ -1,7 +1,6 @@
 import sys
 import os
 import signal
-import threading
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QTextEdit, QPushButton, QComboBox, 
@@ -13,13 +12,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QTextDocument
 
 # 将当前目录添加到Python路径
-if getattr(sys, 'frozen', False):
-    # 如果是打包后的应用
-    current_dir = sys._MEIPASS
-else:
-    # 如果是源码运行
-    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, current_dir)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(current_dir, '..'))
 
 from src.core import DeviceManager, Device, LogcatReader, LogEntry, LogLevel
 
@@ -885,7 +879,7 @@ class LogMasterPro(QMainWindow):
             self.start_logging()
             
     def start_logging(self):
-        """开始日志记录 - 增强版，包含自动重启机制"""
+        """开始日志记录 - 增强版"""
         print("开始日志记录函数被调用")
         
         # 添加状态保护
@@ -934,9 +928,6 @@ class LogMasterPro(QMainWindow):
             
             self.update_log_stats()
             
-            # 启动后台监控线程
-            self._start_logging_monitor()
-            
             print("日志记录启动成功")
             
         except Exception as e:
@@ -974,11 +965,8 @@ class LogMasterPro(QMainWindow):
             self.setWindowTitle('Logmaster - Android日志分析工具')
     
     def stop_logging(self):
-        """停止日志记录 - 增强版"""
+        """停止日志记录"""
         print("停止日志记录函数被调用")
-        
-        # 停止监控线程
-        self._stop_logging_monitor()
         
         if self.log_update_thread:
             print("停止日志更新线程...")
@@ -993,94 +981,6 @@ class LogMasterPro(QMainWindow):
         self.update_ui_for_logging_state(False)
         
         print("日志记录已停止")
-    
-    def _start_logging_monitor(self):
-        """启动日志记录监控线程"""
-        if hasattr(self, '_logging_monitor_thread') and self._logging_monitor_thread and self._logging_monitor_thread.is_alive():
-            print("监控线程已在运行")
-            return
-            
-        self._logging_monitor_running = True
-        self._logging_monitor_thread = threading.Thread(target=self._logging_monitor_loop, daemon=True)
-        self._logging_monitor_thread.start()
-        print("日志监控线程已启动")
-    
-    def _stop_logging_monitor(self):
-        """停止日志记录监控线程"""
-        if hasattr(self, '_logging_monitor_running'):
-            self._logging_monitor_running = False
-            if hasattr(self, '_logging_monitor_thread') and self._logging_monitor_thread and self._logging_monitor_thread.is_alive():
-                self._logging_monitor_thread.join(timeout=2)
-                print("日志监控线程已停止")
-    
-    def _logging_monitor_loop(self):
-        """日志记录监控循环 - 检测异常停止并自动重启"""
-        check_interval = 3  # 每3秒检查一次
-        max_silent_time = 15  # 最大静默时间15秒
-        restart_attempts = 0
-        max_restart_attempts = 3  # 最多连续重启3次
-        
-        while getattr(self, '_logging_monitor_running', False) and self.is_logging:
-            try:
-                current_time = time.time()
-                stats = self.logcat_reader.get_stats()
-                
-                # 检查logcat读取器状态
-                reader_running = stats.get('is_running', False)
-                last_log_time = stats.get('last_log_time', 0)
-                processed_logs = stats.get('processed_logs', 0)
-                
-                silent_time = current_time - last_log_time
-                
-                # 如果读取器停止运行，或者静默时间太长，尝试重启
-                if not reader_running or (silent_time > max_silent_time and processed_logs > 0):
-                    print(f"检测到日志记录异常: 运行状态={reader_running}, 静默时间={silent_time:.1f}秒")
-                    
-                    if restart_attempts < max_restart_attempts:
-                        restart_attempts += 1
-                        print(f"尝试自动重启日志记录 (第{restart_attempts}次)")
-                        
-                        # 停止当前记录
-                        try:
-                            self.logcat_reader.stop_logcat()
-                        except:
-                            pass
-                        
-                        # 延迟后重启
-                        time.sleep(2)
-                        
-                        # 检查设备状态
-                        if self.current_device and self.current_device.status == "device":
-                            try:
-                                # 重新获取过滤器设置
-                                filters = self.get_filter_settings()
-                                self.logcat_reader.start_logcat(self.current_device.serial, 
-                                                              clear_buffer=False,  # 不清除缓冲区，避免数据丢失
-                                                              filters=filters)
-                                print("自动重启成功")
-                                restart_attempts = 0  # 重置重启计数
-                            except Exception as restart_e:
-                                print(f"自动重启失败: {restart_e}")
-                        else:
-                            print("设备状态异常，无法自动重启")
-                    else:
-                        print(f"已达到最大重启次数({max_restart_attempts})，停止自动重启")
-                        # 可以选择停止整个记录或继续监控
-                        break
-                else:
-                    # 如果一切正常，重置重启计数
-                    if restart_attempts > 0:
-                        print("日志记录恢复正常，重置重启计数")
-                        restart_attempts = 0
-                
-            except Exception as e:
-                print(f"日志监控线程出错: {e}")
-                
-            # 等待下一次检查
-            time.sleep(check_interval)
-        
-        print("日志监控线程结束")
-        # 如果是因为异常退出，可以在这里添加额外的处理逻辑
         
     def get_filter_settings(self) -> dict:
         """获取过滤器设置 - 修复空值处理"""
@@ -1479,12 +1379,9 @@ def main():
         from PyQt5.QtGui import QIcon
         import os
         
-        # 获取基础目录
-        if getattr(sys, 'frozen', False):
-            project_root = sys._MEIPASS
-        else:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(current_dir)
+        # 获取当前目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
         
         # 尝试多个图标路径（相对路径，更可靠）
         icon_paths = [

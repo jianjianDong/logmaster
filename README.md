@@ -53,13 +53,20 @@ adb version
 python3 LogMasterPro.py
 ```
 
-#### 方法2: 创建macOS应用（推荐）
+#### 方法2: 独立安装包（推荐）
+对于非开发者用户，你可以使用打包脚本生成一个完全独立的 macOS 应用程序（`.dmg`格式），用户无需安装 Python 也能直接运行。
+```bash
+./scripts/build_app.sh
+```
+执行完毕后，将生成的 `dist/LogMasterPro.dmg` 发送给其他用户即可。
+
+#### 方法3: 创建macOS外壳应用
 ```bash
 ./scripts/create_macos_app.sh
 # 然后在Applications文件夹中找到LogMaster
 ```
 
-#### 方法3: 使用启动脚本
+#### 方法4: 使用启动脚本
 ```bash
 ./scripts/launch.sh
 ```

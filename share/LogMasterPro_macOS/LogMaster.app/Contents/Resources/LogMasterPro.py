@@ -9,12 +9,7 @@ import os
 import signal
 
 # 将src目录添加到Python路径
-if getattr(sys, 'frozen', False):
-    # 如果是打包后的应用
-    current_dir = sys._MEIPASS
-else:
-    # 如果是源码运行
-    current_dir = os.path.dirname(os.path.abspath(__file__))
+current_dir = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_dir)
 

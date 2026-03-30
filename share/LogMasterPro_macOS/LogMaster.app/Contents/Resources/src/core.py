@@ -261,8 +261,6 @@ class LogcatReader:
         self._buffer_lock = threading.Lock()
         self._last_log_time = time.time()
         self._log_count = 0
-        self._health_check_thread: Optional[threading.Thread] = None  # 健康检查线程
-        self._health_check_running = False
         
     def add_log_callback(self, callback: Callable):
         """添加日志回调函数"""
@@ -283,7 +281,7 @@ class LogcatReader:
     
     def start_logcat(self, device_serial: str, clear_buffer: bool = True,
                     filters: Optional[dict] = None):
-        """开始读取logcat - 修复过滤器更新逻辑，增强健壮性"""
+        """开始读取logcat - 修复过滤器更新逻辑"""
         if self._running:
             self.stop_logcat()
         
@@ -320,9 +318,6 @@ class LogcatReader:
                                                daemon=True)
             self._read_thread.start()
             
-            # 启动健康检查线程
-            self._start_health_check(device_serial)
-            
             print("Logcat读取线程已启动")
             
         except Exception as e:
@@ -330,24 +325,18 @@ class LogcatReader:
             self._running = False
             
     def stop_logcat(self):
-        """停止读取logcat - 增强版，包含健康检查线程停止"""
+        """停止读取logcat"""
         print("正在停止logcat...")
         self._running = False
-        self._health_check_running = False
-        
-        # 停止健康检查线程
-        if self._health_check_thread and self._health_check_thread.is_alive():
-            self._health_check_thread.join(timeout=1)
         
         if self.process:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                print("进程终止超时，强制杀死进程")
                 self.process.kill()
-            except Exception as e:
-                print(f"停止进程时出错: {e}")
+            except:
+                pass
             finally:
                 self.process = None
         
@@ -366,84 +355,55 @@ class LogcatReader:
             print(f"清除缓冲区失败: {e}")
     
     def _read_logcat_output(self, device_serial: str):
-        """读取logcat输出的线程函数 - 增强异常处理和自动恢复"""
+        """读取logcat输出的线程函数"""
         print("开始读取logcat输出...")
         if not self.process:
             print("进程不存在")
             return
             
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-        
         try:
             while self._running and self.process.poll() is None:
-                try:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        # 如果连续10次都读到空行，认为进程可能有问题
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            print(f"连续{max_consecutive_errors}次读取空行，可能进程异常")
-                            break
-                        time.sleep(0.01)  # 短暂等待，避免CPU占用过高
-                        continue
+                line = self.process.stdout.readline()
+                if not line:
+                    time.sleep(0.01)  # 短暂等待，避免CPU占用过高
+                    continue
+                
+                # 调试输出
+                if self._log_count < 5:  # 只显示前5行的调试信息
+                    print(f"原始日志行: {line.strip()}")
+                
+                log_entry = self._parse_log_line(line.strip(), device_serial)
+                if log_entry:
+                    self._log_count += 1
                     
-                    # 重置错误计数
-                    consecutive_errors = 0
-                    
-                    # 调试输出
-                    if self._log_count < 5:  # 只显示前5行的调试信息
-                        print(f"原始日志行: {line.strip()}")
-                    
-                    log_entry = self._parse_log_line(line.strip(), device_serial)
-                    if log_entry:
-                        self._log_count += 1
+                    # 应用过滤器
+                    if self._should_include_log(log_entry):
+                        # 添加到缓冲区
+                        with self._buffer_lock:
+                            self._log_buffer.append(log_entry)
+                            if len(self._log_buffer) > self._buffer_size:
+                                self._log_buffer.pop(0)
                         
-                        # 应用过滤器
-                        if self._should_include_log(log_entry):
-                            # 添加到缓冲区
-                            with self._buffer_lock:
-                                self._log_buffer.append(log_entry)
-                                if len(self._log_buffer) > self._buffer_size:
-                                    self._log_buffer.pop(0)
-                            
-                            # 通知回调
-                            self._notify_callbacks(log_entry)
-                            
-                            # 更新最后日志时间
-                            self._last_log_time = time.time()
-                            
-                            if self._log_count <= 5:
-                                print(f"处理日志: {log_entry.tag} - {log_entry.message[:50]}")
-                        else:
-                            if self._log_count <= 5:
-                                print(f"日志被过滤: {log_entry.tag} - {log_entry.message[:50]}")
-                                
-                except Exception as inner_e:
-                    consecutive_errors += 1
-                    print(f"处理单行日志时出错 ({consecutive_errors}/{max_consecutive_errors}): {inner_e}")
-                    
-                    # 如果连续错误太多，退出循环
-                    if consecutive_errors >= max_consecutive_errors:
-                        print("连续错误过多，停止日志读取")
-                        break
+                        # 通知回调
+                        self._notify_callbacks(log_entry)
                         
-                    # 短暂延迟后重试
-                    time.sleep(0.1)
-                    
+                        # 更新最后日志时间
+                        self._last_log_time = time.time()
+                        
+                        if self._log_count <= 5:
+                            print(f"处理日志: {log_entry.tag} - {log_entry.message[:50]}")
+                    else:
+                        if self._log_count <= 5:
+                            print(f"日志被过滤: {log_entry.tag} - {log_entry.message[:50]}")
+                        
         except Exception as e:
             print(f"读取logcat输出时出错: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self._running = False
-            process_status = self.process.poll() if self.process else 'None'
-            print(f"日志读取线程结束，运行状态: {self._running}, 进程状态: {process_status}")
+            print(f"日志读取线程结束，运行状态: {self._running}, 进程状态: {self.process.poll() if self.process else 'None'}")
             print(f"总共处理了 {self._log_count} 条日志")
-            
-            # 如果是因为异常退出且仍在运行状态，通知外部需要重启
-            if self._running and consecutive_errors >= max_consecutive_errors:
-                print("日志读取异常终止，建议外部重启")
     
     def _parse_log_line(self, line: str, device_serial: str) -> Optional[LogEntry]:
         """解析logcat输出行"""
@@ -614,55 +574,3 @@ class LogcatReader:
                 'last_log_time': self._last_log_time,
                 'is_running': self._running
             }
-    
-    def _start_health_check(self, device_serial: str):
-        """启动健康检查线程"""
-        if self._health_check_running:
-            return
-            
-        self._health_check_running = True
-        self._health_check_thread = threading.Thread(target=self._health_check_loop,
-                                                   args=(device_serial,), 
-                                                   daemon=True)
-        self._health_check_thread.start()
-        print("健康检查线程已启动")
-    
-    def _health_check_loop(self, device_serial: str):
-        """健康检查循环"""
-        check_interval = 5  # 每5秒检查一次
-        max_idle_time = 30  # 最大空闲时间30秒
-        
-        while self._health_check_running and self._running:
-            try:
-                current_time = time.time()
-                idle_time = current_time - self._last_log_time
-                
-                # 检查进程状态
-                process_alive = (self.process and self.process.poll() is None)
-                
-                # 如果进程不在运行，退出循环
-                if not process_alive:
-                    print("健康检查: ADB进程已停止")
-                    break
-                
-                # 如果空闲时间太长，认为可能有问题
-                if idle_time > max_idle_time and self._log_count > 0:
-                    print(f"健康检查警告: 日志空闲时间超过{max_idle_time}秒 (空闲: {idle_time:.1f}秒)")
-                    # 这里可以添加重启逻辑，但暂时只警告
-                
-                # 检查线程状态
-                thread_alive = (self._read_thread and self._read_thread.is_alive())
-                if not thread_alive:
-                    print("健康检查警告: 读取线程已停止")
-                    break
-                    
-            except Exception as e:
-                print(f"健康检查出错: {e}")
-                
-            # 等待下一次检查
-            time.sleep(check_interval)
-        
-        print("健康检查线程结束")
-        # 如果健康检查线程结束，但主线程还在运行，说明有问题
-        if self._running:
-            print("健康检查线程异常结束，建议重启日志记录")
