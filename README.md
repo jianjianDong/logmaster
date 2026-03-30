@@ -10,7 +10,17 @@
 ### macOS 独立版安装包
 无需配置任何 Python 环境或依赖，下载双击即可使用。
 
-👉 **[下载 LogMaster Pro 最新版 (macOS DMG)](https://github.com/jianjianDong/logmaster/releases/latest/download/LogMasterPro.dmg)** 👈
+👉 **[下载 LogMaster Pro v1.1.0 (macOS DMG)](https://github.com/jianjianDong/logmaster/releases/download/v1.1.0/LogMasterPro.dmg)** 👈
+
+### 更新日志
+
+#### v1.1.0 (2026-03-30)
+- ✨ 现代化暗色主题，VS Code 风格界面
+- 🐛 修复应用启动闪退问题
+- 🐛 修复 PyQt5 模块未正确打包问题
+- 🐛 修复颜色高亮不显示的问题
+- ⚡ 批量日志渲染优化，性能大幅提升
+- 🔧 更清晰的搜索控件（文字标签替代图标）
 
 ---
 
